@@ -2,7 +2,7 @@
 # =============================================================================
 # SBSM (Sing-Box Subscription Manager) - Podkop Edition
 # Description: Manage proxy subscriptions for Sing-Box + Podkop on OpenWRT
-# Version: 0.4.1
+# Version: 0.5.0
 # =============================================================================
 
 # =============================================================================
@@ -13,6 +13,7 @@
 SBSM_CONF_DIR="${SBSM_CONF_DIR:-/etc/sing-box}"
 SBSM_DB_FILE="$SBSM_CONF_DIR/sbsm.json"
 SBSM_SUBS_FILE="$SBSM_CONF_DIR/sbsm.subs"
+SBSM_CONFIG_FILE="$SBSM_CONF_DIR/config.json"
 PODKOP_CONFIG="${PODKOP_CONFIG:-/etc/config/podkop}"
 
 # Performance settings
@@ -114,7 +115,7 @@ validate_url() {
 dependency_check() {
     local missing=""
     local cmd
-    for cmd in jq wget curl grep sed awk base64 nc; do
+    for cmd in jq wget curl grep sed awk base64; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
             missing="$missing $cmd"
         fi
@@ -154,11 +155,9 @@ cfg_set() {
         ' "$SBSM_CONF_FILE" > "$tmp" && mv "$tmp" "$SBSM_CONF_FILE"
     else
         awk -v sec="$section" -v k="$key" -v v="$value" '
+            /^\[/ { cur = substr($0, 2, length($0)-2) }
             { print }
-            /^\[/ { cur = substr($0, 2, length($0)-2); pending = 1 }
-            pending && cur == sec && !done { print k "=" v; done = 1 }
-            /^[^[]/ { pending = 0 }
-            END { if (!done && cur == sec) print k "=" v }
+            cur == sec && !done { print k "=" v; done = 1 }
         ' "$SBSM_CONF_FILE" > "$tmp" && mv "$tmp" "$SBSM_CONF_FILE"
     fi
 }
@@ -211,7 +210,7 @@ validate_proxy_link() {
     url=$(printf '%s' "$url" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
     [ -z "$url" ] && return 1
     
-    # Protocal detection
+    # Protocol detection
     case "$url" in
         vless://*)       validate_vless_url "$url" ;;
         ss://*)          validate_ss_url "$url" ;;
@@ -325,7 +324,7 @@ validate_ss_url() {
     fi
 
     # Remove fragment and query
-    main_part=$(printf '%s' "$url" | sed -E 's/[?#].*//')
+    main_part=$(printf '%s' "$url" | sed 's/[?#].*//')
 
     # Extract base64 part
     encrypted_part=$(printf '%s' "$main_part" | sed -n 's|^ss://\([^/@]*\).*|\1|p')
@@ -338,9 +337,13 @@ validate_ss_url() {
     if printf '%s' "$main_part" | grep -q '@'; then
         server_part=$(printf '%s' "$url" | sed -n 's|.*://[^@]*@\([^/?#]*\).*|\1|p')
     else
-        # Full legacy URL decoding would be complex in pure shell, 
-        # so we assume it follows the base64 format which usually includes host:port
-        server_part=""
+        local decoded
+        decoded=$(printf '%s' "$encrypted_part" | base64 -d 2>/dev/null)
+        if [ -z "$decoded" ] || ! printf '%s' "$decoded" | grep -qE '^[A-Za-z0-9.+_-]+:[^@]+@[^:]+:[0-9]+'; then
+            log_debug "SS: legacy base64 URL is invalid or unparseable"
+            return 1
+        fi
+        server_part=$(printf '%s' "$decoded" | sed 's|.*@||')
     fi
     
     if [ -n "$server_part" ]; then
@@ -413,18 +416,15 @@ validate_trojan_url() {
 #         socks5://{host}:{port}
 validate_socks_url() {
     local url="$1"
-    local body auth_host host_port host port port_num
-    
+    local body auth_host host_port host port port_num auth_part username
+
     body=$(printf '%s' "$url" | sed 's|^socks5://||' | sed 's|^socks4a://||' | sed 's|^socks4://||')
     auth_host="${body%%#*}"
     
     if printf '%s' "$auth_host" | grep -q '@'; then
-        local auth_part host_port
         auth_part=$(printf '%s' "$auth_host" | sed 's/@.*//')
         host_port=$(printf '%s' "$auth_host" | sed 's|.*@||')
         
-        # Validate username is present
-        local username
         username=$(printf '%s' "$auth_part" | cut -d: -f1)
         if [ -z "$username" ]; then
             log_debug "SOCKS: missing username"
@@ -486,7 +486,7 @@ validate_socks_url() {
 #         hy2://{password}@{host}:{port}?{query_params}#[fragment]
 validate_hy2_url() {
     local url="$1"
-    local prefix body main_part query_part auth_host_port password_part host_port host port port_num
+    local prefix body main_part query_part auth_host_port password_part host_port host port port_num insecure obfs
     
     # Detect prefix
     if printf '%s' "$url" | grep -q '^hysteria2://'; then
@@ -560,16 +560,12 @@ validate_hy2_url() {
     
     # Validate query parameters if present
     if [ -n "$query_part" ]; then
-        # Check insecure parameter
-        local insecure
         insecure=$(printf '%s' "$query_part" | grep -oE 'insecure=[^&]*' | cut -d= -f2)
         if [ -n "$insecure" ] && [ "$insecure" != "0" ] && [ "$insecure" != "1" ]; then
             log_debug "HY2: insecure must be 0 or 1"
             return 1
         fi
         
-        # Check obfs parameter
-        local obfs
         obfs=$(printf '%s' "$query_part" | grep -oE 'obfs=[^&]*' | cut -d= -f2)
         if [ -n "$obfs" ]; then
             case "$obfs" in
@@ -783,7 +779,7 @@ fetch_subscriptions() {
         # Filter proxies to a temporary file (POSIX compatibility)
         local filtered_file
         filtered_file=$(create_temp_file)
-        grep -E '^(vless|vmess|ss|trojan|hy2|hysteria2)://' "$raw_file" > "$filtered_file" 2>/dev/null
+        grep -E '^(vless|vmess|ss|trojan|hy2|hysteria2|socks4|socks4a|socks5)://' "$raw_file" > "$filtered_file" 2>/dev/null
         
         while IFS= read -r line || [ -n "$line" ]; do
             line=$(printf '%s' "$line" | tr -d '\r')
@@ -816,7 +812,7 @@ fetch_subscriptions() {
 
             local remark url_clean
             remark="${line##*#}"
-            url_clean=$(printf '%s' "$line" | tr -d "'")
+            url_clean=$(printf '%s' "$line" | sed "s/'/'\\\\''/g")
 
             local new_entry
             new_entry=$(jq -n --arg u "$url_clean" --arg r "$remark" '{"url":$u,"remark":$r}')
@@ -831,119 +827,215 @@ fetch_subscriptions() {
         total_added=$((total_added + count))
     done < "$SBSM_SUBS_FILE"
     
-    # Write all entries at once (single jq call)
-    printf '%s' "$all_entries" > "$SBSM_DB_FILE"
+    # Merge new entries with existing DB (dedup by URL)
+    if [ "$total_added" -gt 0 ]; then
+        local existing_db
+        existing_db=$(cat "$SBSM_DB_FILE" 2>/dev/null || echo '[]')
+        printf '%s' "$existing_db" | jq --argjson new "$all_entries" '. + $new | unique_by(.url)' > "$SBSM_DB_FILE" 2>/dev/null
+    else
+        log_warn "No new proxies fetched, keeping existing database"
+    fi
+
+    local final_count
+    final_count=$(jq 'length' "$SBSM_DB_FILE" 2>/dev/null || echo 0)
 
     rm -f "$raw_file"
-    log_info "Fetch complete. Total proxies: $total_added"
-    echo -e "${GREEN}Done.${NC} Total proxies in database: ${YELLOW}$total_added${NC}"
+    log_info "Fetch complete. Total proxies in DB: $final_count"
+    echo -e "${GREEN}Done.${NC} Total proxies in database: ${YELLOW}$final_count${NC}"
 
     [ "$total_added" -gt 0 ] && return 0 || return 1
 }
 
 # =============================================================================
-# F. Proxy Availability Check
+# F. Proxy Availability Check (via sing-box)
 # =============================================================================
 
-# check_proxy_tcp() - Test TCP reachability of proxy URL
+SBSM_TEST_URL="https://www.gstatic.com/generate_204"
+SBSM_TEST_TIMEOUT="${SBSM_TEST_TIMEOUT:-5000}"
+
+# _parse_host_port() - Extract host:port from proxy URL
 # Arguments: $1=proxy URL
-# Returns: 0=reachable, 1=unreachable
-check_proxy_tcp() {
+# Returns: "host:port" string
+_parse_host_port() {
     local url="$1"
-    local host_port server port timeout_secs
-    
-    # Parse server:port from URL
+    local host_port
     host_port=$(printf '%s' "$url" | sed -n 's|.*://[^@]*@\([^/?#]*\).*|\1|p')
     [ -z "$host_port" ] && host_port=$(printf '%s' "$url" | sed -n 's|.*://\([^/?#]*\).*|\1|p')
-    
-    [ -z "$host_port" ] && return 1
-    
-    server="${host_port%%:*}"
-    port="${host_port##*:}"
-    port="${port%%[/?#]*}"
-    
-    [ -z "$server" ] || [ -z "$port" ] && return 1
-    
-    # TCP connect test using background nc with timeout
-    timeout_secs="${PROXY_TEST_TIMEOUT:-2}"
-    
-    (
-        printf '' | nc "$server" "$port" >/dev/null 2>&1
-    ) &
-    local pid=$!
-    
-    # Brief delay to let nc attempt connection
-    sleep 1
-    
-    # If process already exited, connection failed
-    if ! kill -0 "$pid" 2>/dev/null; then
-        wait "$pid" 2>/dev/null
-        return $?
+    printf '%s' "$host_port"
+}
+
+# _build_tag_map() - Build mapping from "host:port" to outbound tag
+# Reads sing-box config.json, outputs "host:port tag" lines
+# Arguments: $1=config file path
+_build_tag_map() {
+    local config_file="$1"
+    [ ! -f "$config_file" ] && return 1
+    jq -r '[.outbounds[] | select(.server and .server_port)] | .[] | (.server + ":" + (.server_port | tostring) + " " + .tag)' \
+        "$config_file" 2>/dev/null
+}
+
+# _find_tag_by_host_port() - Look up outbound tag by host:port
+# Arguments: $1=tag_map_file, $2=host:port
+# Returns: tag string or empty
+_find_tag_by_host_port() {
+    local map_file="$1" target="$2"
+    [ ! -f "$map_file" ] && { printf ''; return; }
+    grep -E "^${target} " "$map_file" 2>/dev/null | head -1 | sed 's/^[^ ]* //'
+}
+
+# _get_clash_api_addr() - Detect sing-box clash_api address from config
+# Returns: API base URL or empty string
+_get_clash_api_addr() {
+    [ ! -f "$SBSM_CONFIG_FILE" ] && { printf ''; return 1; }
+    local addr
+    addr=$(jq -r '.experimental.clash_api.external_controller // empty' "$SBSM_CONFIG_FILE" 2>/dev/null)
+    [ -z "$addr" ] && { printf ''; return 1; }
+    printf 'http://%s' "$addr"
+}
+
+# _ensure_singbox_running() - Ensure sing-box is running
+# Returns: 0=running, 1=could not start
+_ensure_singbox_running() {
+    if [ -x "/etc/init.d/sing-box" ] && /etc/init.d/sing-box status >/dev/null 2>&1; then
+        return 0
     fi
-    
-    # Process still running = connection succeeded
-    kill "$pid" 2>/dev/null
-    wait "$pid" 2>/dev/null
-    return 0
+    if [ -x "/etc/init.d/podkop" ] && /etc/init.d/podkop status >/dev/null 2>&1; then
+        return 0
+    fi
+    if [ -f "$SBSM_CONFIG_FILE" ]; then
+        if ! sing-box check -c "$SBSM_CONFIG_FILE" >/dev/null 2>&1; then
+            log_error "Cannot start sing-box: config validation failed"
+            return 1
+        fi
+        if [ -x "/etc/init.d/sing-box" ]; then
+            /etc/init.d/sing-box start >/dev/null 2>&1
+        elif [ -x "/etc/init.d/podkop" ]; then
+            /etc/init.d/podkop start >/dev/null 2>&1
+        else
+            sing-box run -c "$SBSM_CONFIG_FILE" &
+        fi
+        sleep 3
+        return 0
+    fi
+    return 1
 }
 
 check_remove_unavailable() {
     local db_file="$SBSM_DB_FILE"
-    
+
     local total
     total=$(jq 'length' "$db_file" 2>/dev/null || echo 0)
-    
+
     if [ "$total" -eq 0 ]; then
         echo -e "${YELLOW}Database is empty.${NC}"
         return 0
     fi
-    
-    log_info "Checking $total proxies (TCP connect test, timeout=${PROXY_TEST_TIMEOUT}s)..."
-    echo -e "${MAGENTA}Checking $total proxies${NC} (TCP connect test)..."
-    
-    # Use temp file to track good proxies
+
+    log_info "Checking $total proxies via sing-box..."
+    echo -e "${MAGENTA}Checking $total proxies${NC} (sing-box proxy test)..."
+
+    _ensure_singbox_running
+
+    local api_base=""
+    local use_api=0
+    api_base=$(_get_clash_api_addr)
+    if [ -n "$api_base" ]; then
+        if curl -s --max-time 3 "${api_base}/version" >/dev/null 2>&1; then
+            use_api=1
+            log_info "Using clash_api at $api_base"
+            echo -e "  ${CYAN}Method: clash_api${NC} ($api_base)"
+        fi
+    fi
+
+    if [ "$use_api" -eq 0 ] && [ ! -f "$SBSM_CONFIG_FILE" ]; then
+        log_error "No sing-box config found, cannot test proxies"
+        echo -e "  ${RED}Error: No sing-box config. Run sync first.${NC}"
+        return 1
+    fi
+
+    if [ "$use_api" -eq 0 ]; then
+        log_info "Using sing-box tools fetch"
+        echo -e "  ${CYAN}Method: sing-box tools fetch${NC}"
+    fi
+
+    local tag_map
+    tag_map=$(create_temp_file)
+    _build_tag_map "$SBSM_CONFIG_FILE" > "$tag_map"
+
     local good_list
     good_list=$(create_temp_file)
     echo "[]" > "$good_list"
-    
-    local ok=0
-    local fail=0
+
+    local ok=0 fail=0 untagged=0
     local temp_results
     temp_results=$(create_temp_file)
-    
+
     local index=0
     while [ "$index" -lt "$total" ]; do
         local entry url remark
-        
+
         entry=$(jq -r ".[$index] | @base64" "$db_file" 2>/dev/null)
         [ -z "$entry" ] && { index=$((index + 1)); continue; }
-        
+
         url=$(printf '%s' "$entry" | base64 -d 2>/dev/null | jq -r '.url' 2>/dev/null)
         remark=$(printf '%s' "$entry" | base64 -d 2>/dev/null | jq -r '.remark' 2>/dev/null | cut -c1-40)
-        
+
+        local host_port
+        host_port=$(_parse_host_port "$url")
+
+        local tag
+        tag=$(_find_tag_by_host_port "$tag_map" "$host_port")
+
         printf '  Testing %-42s ' "${remark}..."
-        
-        if check_proxy_tcp "$url"; then
-            printf "${GREEN}OK${NC}\n"
+
+        if [ -z "$tag" ]; then
+            printf "${DGRAY}SKIP${NC} ${DGRAY}(no outbound)${NC}\n"
+            untagged=$((untagged + 1))
+            index=$((index + 1))
+            continue
+        fi
+
+        local alive=0
+        if [ "$use_api" -eq 1 ]; then
+            local api_result delay
+            api_result=$(curl -s --max-time 10 \
+                "${api_base}/proxies/${tag}/delay?timeout=${SBSM_TEST_TIMEOUT}&url=${SBSM_TEST_URL}" 2>/dev/null)
+            if [ -n "$api_result" ] && printf '%s' "$api_result" | grep -q '"delay"'; then
+                delay=$(printf '%s' "$api_result" | jq -r '.delay' 2>/dev/null)
+                alive=1
+                printf "${GREEN}OK${NC} ${DGRAY}(%sms)${NC}\n" "$delay"
+            else
+                printf "${RED}FAIL${NC}\n"
+            fi
+        else
+            rm -f /tmp/sing-box/cache.db 2>/dev/null
+            if sing-box -c "$SBSM_CONFIG_FILE" tools fetch \
+                --outbound "$tag" "$SBSM_TEST_URL" >/dev/null 2>/dev/null; then
+                alive=1
+                printf "${GREEN}OK${NC}\n"
+            else
+                printf "${RED}FAIL${NC}\n"
+            fi
+        fi
+
+        if [ "$alive" -eq 1 ]; then
             local entry_json
             entry_json=$(printf '%s' "$entry" | base64 -d 2>/dev/null)
             jq --argjson e "$entry_json" '. += [$e]' "$good_list" > "$temp_results" && \
                 mv "$temp_results" "$good_list"
             ok=$((ok + 1))
         else
-            printf "${RED}FAIL${NC}\n"
             fail=$((fail + 1))
         fi
         index=$((index + 1))
     done
-    
-    # Update database with good proxies only
+
     cp "$good_list" "$SBSM_DB_FILE"
-    
-    log_info "Check complete: $ok available, $fail removed"
+
+    log_info "Check complete: $ok alive, $fail removed, $untagged skipped"
     echo ""
-    echo -e "${GREEN}Results:${NC} $ok available, ${RED}$fail removed.${NC}"
-    
+    echo -e "${GREEN}Results:${NC} $ok alive, ${RED}$fail removed${NC}, ${DGRAY}$untagged skipped${NC}"
+
     return 0
 }
 
@@ -1122,7 +1214,7 @@ _manage_uci_russia_inside() {
     local batch_file; batch_file=$(create_temp_file); : > "$batch_file"
     if command -v uci >/dev/null 2>&1; then
         uci show podkop 2>/dev/null | grep '=section' | sed 's/=section//' | sed 's/podkop\.//' | while IFS= read -r sec; do
-            echo "$sec" | grep -qE '^[A-Z]{2}$|^GENERAL$|^SERVICES$|^RUSSIA_INSIDE$|^sbsm_' && printf 'delete podkop.%s\n' "$sec" >> "$batch_file"
+            echo "$sec" | grep -qE '^[A-Z]{2}$|^GENERAL$|^SERVICES$|^RUSSIA_INSIDE$|^SUBSCRIPTION$|^sbsm_' && printf 'delete podkop.%s\n' "$sec" >> "$batch_file"
         done
         
         # Create RU section
@@ -1134,6 +1226,7 @@ _manage_uci_russia_inside() {
         # Create RUSSIA_INSIDE section
         if [ -s "$other_file" ]; then
             printf 'set podkop.RUSSIA_INSIDE=section\nset podkop.RUSSIA_INSIDE.connection_type=proxy\nset podkop.RUSSIA_INSIDE.proxy_config_type=urltest\n' >> "$batch_file"
+            printf 'set podkop.RUSSIA_INSIDE.urltest_testing_url=https://www.gstatic.com/generate_204\n' >> "$batch_file"
             printf "add_list podkop.RUSSIA_INSIDE.community_lists='russia_inside'\n" >> "$batch_file"
             while IFS= read -r link; do printf "add_list podkop.RUSSIA_INSIDE.urltest_proxy_links='%s'\n" "$link" >> "$batch_file"; done < "$other_file"
         fi
@@ -1154,7 +1247,7 @@ _manage_uci_subscription() {
     local db_file="$SBSM_DB_FILE"
     local sub_file; sub_file=$(create_temp_file); : > "$sub_file"
     local total; total=$(jq 'length' "$db_file" 2>/dev/null || echo 0)
-    local index=0 count=0
+    local index=0 count=0 ufp
     while [ "$index" -lt "$total" ]; do
         local url; url=$(jq -r ".[$index].url" "$db_file" 2>/dev/null)
         case "$url" in *xhttp*|*mode=auto*) index=$((index+1)); continue ;; vless://*security=reality*) ufp=$(printf '%s' "$url" | grep -oE 'fp=[^&]*' | cut -d= -f2); [ -z "$ufp" ] && { index=$((index+1)); continue; } ;; esac
@@ -1162,11 +1255,14 @@ _manage_uci_subscription() {
         printf '%s\n' "$q_link" >> "$sub_file"; count=$((count+1)); index=$((index+1))
     done
     echo "  subscription: $count links"
-    local batch_file; batch_file=$(create_temp_file)
+    local batch_file; batch_file=$(create_temp_file); : > "$batch_file"
     if command -v uci >/dev/null 2>&1; then
-        uci show podkop.SUBSCRIPTION >/dev/null 2>&1 && printf 'delete podkop.SUBSCRIPTION\n' > "$batch_file"
+        uci show podkop 2>/dev/null | grep '=section' | sed 's/=section//' | sed 's/podkop\.//' | while IFS= read -r sec; do
+            echo "$sec" | grep -qE '^[A-Z]{2}$|^GENERAL$|^SERVICES$|^RUSSIA_INSIDE$|^SUBSCRIPTION$|^sbsm_' && printf 'delete podkop.%s\n' "$sec" >> "$batch_file"
+        done
         if [ -s "$sub_file" ]; then
             printf 'set podkop.SUBSCRIPTION=section\nset podkop.SUBSCRIPTION.connection_type=proxy\nset podkop.SUBSCRIPTION.proxy_config_type=urltest\n' >> "$batch_file"
+            printf 'set podkop.SUBSCRIPTION.urltest_testing_url=https://www.gstatic.com/generate_204\n' >> "$batch_file"
             while IFS= read -r link; do printf "add_list podkop.SUBSCRIPTION.urltest_proxy_links='%s'\n" "$link" >> "$batch_file"; done < "$sub_file"
         fi
         uci -q batch < "$batch_file" && uci commit podkop && echo -e "${GREEN}UCI sync complete.${NC}"
@@ -1175,7 +1271,7 @@ _manage_uci_subscription() {
 }
 
 remove_empty_sections() {
-    [ -x "/sbin/uci" ] || return 0
+    command -v uci >/dev/null 2>&1 || return 0
     local removed=0
     uci show podkop 2>/dev/null | grep '=section' | sed 's/=section//;s/podkop\.//' | while IFS= read -r sec; do
         if echo "$sec" | grep -qE '^[A-Z]{2}$|^GENERAL$|^SERVICES$'; then
@@ -1187,6 +1283,32 @@ remove_empty_sections() {
     return 0
 }
 
+# cmd_validate() - Validate all proxy URLs in database
+cmd_validate() {
+    local db_file="$SBSM_DB_FILE"
+    local total; total=$(jq 'length' "$db_file" 2>/dev/null || echo 0)
+    if [ "$total" -eq 0 ]; then
+        echo -e "${YELLOW}Database is empty.${NC}"
+        return 0
+    fi
+    echo -e "${MAGENTA}Validating $total proxy URLs...${NC}"
+    local valid=0 invalid=0 index=0
+    while [ "$index" -lt "$total" ]; do
+        local url; url=$(jq -r ".[$index].url" "$db_file" 2>/dev/null)
+        local remark; remark=$(jq -r ".[$index].remark" "$db_file" 2>/dev/null | cut -c1-40)
+        if validate_proxy_link "$url"; then
+            valid=$((valid + 1))
+        else
+            invalid=$((invalid + 1))
+            printf '  ${RED}INVALID${NC} %-42s\n' "${remark}"
+        fi
+        index=$((index + 1))
+    done
+    echo ""
+    echo -e "${GREEN}Results:${NC} $valid valid, ${RED}$invalid invalid${NC} out of $total total"
+    [ "$invalid" -eq 0 ] && return 0 || return 1
+}
+
 # =============================================================================
 # H. Interactive Menus
 # =============================================================================
@@ -1196,7 +1318,7 @@ show_menu() {
         clear
         echo -e "╔════════════════════════════════════════════════════╗"
         echo -e "║  ${BLUE}SBSM — Sing-Box Subscription Manager${NC}              ║"
-        echo -e "║  ${BLUE}Podkop Edition${NC}                      ${DGRAY}v0.4.0${NC}        ║"
+        echo -e "║  ${BLUE}Podkop Edition${NC}                      ${DGRAY}v0.5.0${NC}        ║"
         echo -e "╚════════════════════════════════════════════════════╝"
         local sb_ver="Unknown"
         command -v sing-box >/dev/null 2>&1 && sb_ver=$(sing-box version 2>/dev/null | head -n1)
@@ -1213,7 +1335,7 @@ show_menu() {
         printf "${YELLOW}Choice [0-3]:${NC} "; read -r choice
         case "$choice" in
             1) echo ""; if fetch_subscriptions; then manage_uci && restart_target; fi; echo "Press Enter..."; read -r _ ;;
-            2) echo ""; check_remove_unavailable; manage_uci; remove_empty_sections; restart_target; echo "Press Enter..."; read -r _ ;;
+            2) echo ""; manage_uci; restart_target; sleep 3; check_remove_unavailable; manage_uci; remove_empty_sections; restart_target; echo "Press Enter..."; read -r _ ;;
             3) show_settings_menu ;;
             0) break ;;
             *) echo "Invalid choice."; sleep 1 ;;
@@ -1254,7 +1376,7 @@ show_settings_menu() {
 # =============================================================================
 
 usage() {
-    echo "Usage: $0 {fetch|check|sync|update|status|log|menu}"
+    echo "Usage: $0 {fetch|check|sync|update|validate|mode|status|log|menu}"
     exit 0
 }
 
@@ -1263,9 +1385,11 @@ main() {
     local cmd="${1:-menu}"
     case "$cmd" in
         fetch) dependency_check && init_config && fetch_subscriptions ;;
-        check) dependency_check && init_config && check_remove_unavailable ;;
+        check) dependency_check && init_config && manage_uci && restart_target && sleep 3 && check_remove_unavailable ;;
         sync)  dependency_check && init_config && manage_uci && restart_target ;;
         update) dependency_check && init_config && fetch_subscriptions && manage_uci && restart_target ;;
+        mode)   init_config; [ -n "$2" ] && set_mode "$2"; get_mode ;;
+        validate) dependency_check && init_config && cmd_validate ;;
         status)
             echo "Sing-Box: $(command -v sing-box >/dev/null && sing-box version | head -n1 || echo 'NOT FOUND')"
             echo "Proxies: $(jq 'length' "$SBSM_DB_FILE" 2>/dev/null || echo 0)"
