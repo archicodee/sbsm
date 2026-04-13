@@ -2,7 +2,7 @@
 # =============================================================================
 # SBSM (Sing-Box Subscription Manager) - Extended Edition
 # Description: Manage proxy subscriptions for sing-box extended
-# Version: 0.5.0
+# Version: 0.5.1
 # =============================================================================
 
 # =============================================================================
@@ -18,7 +18,6 @@ SBSM_CONF_FILE="${SBSM_CONF_FILE:-/etc/sing-box/sbsm.conf}"
 
 # Performance settings
 PROXY_TEST_TIMEOUT="${PROXY_TEST_TIMEOUT:-5}"
-SBSM_TEST_URL="${SBSM_TEST_URL:-https://www.gstatic.com/generate_204}"
 
 # Logging
 SBSM_LOG_LEVEL="${SBSM_LOG_LEVEL:-info}"
@@ -100,8 +99,11 @@ dependency_check() {
 cfg_get_raw() {
     local section="$1" key="$2"
     [ -f "$SBSM_CONF_FILE" ] && awk -v sec="$section" -v k="$key" '
-        /^\[/ { cur = substr($0, 2, length($0)-2) }
-        cur == sec { idx = index($0, "="); if (idx > 0) { ck = substr($0, 1, idx-1); gsub(/[[:space:]]/, "", ck); if (ck == k) { print substr($0, idx+1); exit } } }
+        /^\[/ { cur = substr($0, 2, length($0)-2); in_sec = (cur == sec); next }
+        in_sec && index($0, "=") > 0 {
+            idx = index($0, "="); ck = substr($0, 1, idx-1); gsub(/[[:space:]]/, "", ck)
+            if (ck == k) { print substr($0, idx+1); exit }
+        }
     ' "$SBSM_CONF_FILE" 2>/dev/null
 }
 
@@ -111,16 +113,27 @@ cfg_set() {
     local section="$1" key="$2" value="$3" tmp="${SBSM_CONF_FILE}.tmp"
     [ ! -f "$SBSM_CONF_FILE" ] && { printf '[%s]\n%s=%s\n' "$section" "$key" "$value" > "$SBSM_CONF_FILE"; return 0; }
     grep -q "^\[$section\]$" "$SBSM_CONF_FILE" 2>/dev/null || { printf '\n[%s]\n%s=%s\n' "$section" "$key" "$value" >> "$SBSM_CONF_FILE"; return 0; }
-    if grep -A999 "^\[$section\]$" "$SBSM_CONF_FILE" 2>/dev/null | grep -q "^${key}="; then
+    local key_in_section=0
+    key_in_section=$(awk -v sec="$section" -v k="$key" '
+        /^\[/ { cur = substr($0, 2, length($0)-2); in_sec = (cur == sec); next }
+        in_sec && index($0, "=") > 0 {
+            idx = index($0, "="); ck = substr($0, 1, idx-1); gsub(/[[:space:]]/, "", ck)
+            if (ck == k) { print 1; exit }
+        }
+    ' "$SBSM_CONF_FILE" 2>/dev/null)
+    if [ "$key_in_section" = "1" ]; then
         awk -v sec="$section" -v k="$key" -v v="$value" '
-            /^\[/ { cur = substr($0, 2, length($0)-2) }
-            cur == sec { idx = index($0, "="); if (idx > 0) { ck = substr($0, 1, idx-1); gsub(/[[:space:]]/, "", ck); if (ck == k) { printf "%s=%s\n", k, v; next } } }
+            /^\[/ { cur = substr($0, 2, length($0)-2); in_sec = (cur == sec) }
+            in_sec && index($0, "=") > 0 {
+                idx = index($0, "="); ck = substr($0, 1, idx-1); gsub(/[[:space:]]/, "", ck)
+                if (ck == k) { printf "%s=%s\n", k, v; next }
+            }
             { print }
         ' "$SBSM_CONF_FILE" > "$tmp" && mv "$tmp" "$SBSM_CONF_FILE"
     else
         awk -v sec="$section" -v k="$key" -v v="$value" '
-            /^\[/ { cur = substr($0, 2, length($0)-2) }
             { print }
+            /^\[/ { cur = substr($0, 2, length($0)-2) }
             cur == sec && !done { print k "=" v; done = 1 }
         ' "$SBSM_CONF_FILE" > "$tmp" && mv "$tmp" "$SBSM_CONF_FILE"
     fi
@@ -131,11 +144,15 @@ cfg_init() {
     cat > "$SBSM_CONF_FILE" <<'EOF'
 [sbsm_podkop]
 mode=by_country
+check_url=https://www.gstatic.com/generate_204
+check_mode=all
 
 [sbsm_extended]
 mode=by_country
 sb_mode=tun
 ru_srs_urls=
+check_url=https://www.gstatic.com/generate_204
+check_mode=all
 EOF
 }
 
@@ -163,6 +180,15 @@ set_sb_mode() {
 }
 get_ru_srs() { cfg_get "sbsm_extended" "ru_srs_urls" ""; }
 set_ru_srs() { cfg_set "sbsm_extended" "ru_srs_urls" "$1"; }
+get_check_url() { cfg_get "sbsm_extended" "check_url" "https://www.gstatic.com/generate_204"; }
+set_check_url() { cfg_set "sbsm_extended" "check_url" "$1"; }
+get_check_mode() { cfg_get "sbsm_extended" "check_mode" "all"; }
+set_check_mode() {
+    case "$1" in
+        fastest|5|10|20|all) cfg_set "sbsm_extended" "check_mode" "$1" ;;
+        *) log_error "Invalid check_mode: $1 (use: fastest, 5, 10, 20, all)"; return 1 ;;
+    esac
+}
 
 DEFAULT_GEOSITE_RU="https://raw.githubusercontent.com/runetfreedom/russia-v2ray-rules-dat/release/sing-box/rule-set-geosite/geosite-ru-blocked.srs"
 DEFAULT_GEOIP_RU="https://raw.githubusercontent.com/runetfreedom/russia-v2ray-rules-dat/release/sing-box/rule-set-geoip/geoip-ru-blocked.srs"
@@ -780,14 +806,17 @@ _ensure_singbox_running() {
 
 check_remove_unavailable() {
     local db_file="$SBSM_DB_FILE"
+    local check_url; check_url=$(get_check_url)
+    local check_mode; check_mode=$(get_check_mode)
+
     local total; total=$(jq 'length' "$db_file" 2>/dev/null || echo 0)
     if [ "$total" -eq 0 ]; then
         echo -e "${YELLOW}Database is empty.${NC}"
         return 0
     fi
 
-    log_info "Checking $total proxies via sing-box..."
-    echo -e "${MAGENTA}Checking $total proxies${NC} (sing-box proxy test)..."
+    log_info "Checking $total proxies via sing-box (mode=$check_mode, url=$check_url)..."
+    echo -e "${MAGENTA}Checking $total proxies${NC} (mode=${YELLOW}$check_mode${NC}, url=${CYAN}${check_url}${NC})..."
 
     _ensure_singbox_running
 
@@ -815,10 +844,10 @@ check_remove_unavailable() {
     local tag_map; tag_map=$(create_temp_file)
     _build_tag_map "$SBSM_CONFIG_FILE" > "$tag_map"
 
-    local good_list; good_list=$(create_temp_file)
-    echo "[]" > "$good_list"
-    local ok=0 fail=0 untagged=0
-    local temp_results; temp_results=$(create_temp_file)
+    # Collect results: each line = "delay entry_base64"
+    local results_file; results_file=$(create_temp_file)
+    : > "$results_file"
+    local fail=0 untagged=0
 
     local index=0
     while [ "$index" -lt "$total" ]; do
@@ -840,14 +869,13 @@ check_remove_unavailable() {
             continue
         fi
 
-        local alive=0
+        local delay=""
         if [ "$use_api" -eq 1 ]; then
-            local api_result delay
+            local api_result
             api_result=$(curl -s --max-time 10 \
-                "${api_base}/proxies/${tag}/delay?timeout=${PROXY_TEST_TIMEOUT}&url=${SBSM_TEST_URL}" 2>/dev/null)
+                "${api_base}/proxies/${tag}/delay?timeout=${PROXY_TEST_TIMEOUT}&url=${check_url}" 2>/dev/null)
             if [ -n "$api_result" ] && printf '%s' "$api_result" | grep -q '"delay"'; then
                 delay=$(printf '%s' "$api_result" | jq -r '.delay' 2>/dev/null)
-                alive=1
                 printf "${GREEN}OK${NC} ${DGRAY}(%sms)${NC}\n" "$delay"
             else
                 printf "${RED}FAIL${NC}\n"
@@ -855,29 +883,60 @@ check_remove_unavailable() {
         else
             rm -f /tmp/sing-box/cache.db 2>/dev/null
             if sing-box -c "$SBSM_CONFIG_FILE" tools fetch \
-                --outbound "$tag" "$SBSM_TEST_URL" >/dev/null 2>/dev/null; then
-                alive=1
+                --outbound "$tag" "$check_url" >/dev/null 2>/dev/null; then
+                delay="0"
                 printf "${GREEN}OK${NC}\n"
             else
                 printf "${RED}FAIL${NC}\n"
             fi
         fi
 
-        if [ "$alive" -eq 1 ]; then
-            local entry_json; entry_json=$(printf '%s' "$entry" | base64 -d 2>/dev/null)
-            jq --argjson e "$entry_json" '. += [$e]' "$good_list" > "$temp_results" && \
-                mv "$temp_results" "$good_list"
-            ok=$((ok + 1))
+        if [ -n "$delay" ]; then
+            local delay_int; delay_int=$(printf '%s' "$delay" | sed 's/[^0-9]//g')
+            [ -z "$delay_int" ] && delay_int="99999"
+            printf '%05d %s\n' "$delay_int" "$entry" >> "$results_file"
         else
             fail=$((fail + 1))
         fi
         index=$((index + 1))
     done
 
+    # Sort by delay and apply check_mode filter
+    local sorted_file; sorted_file=$(create_temp_file)
+    sort -n "$results_file" > "$sorted_file"
+
+    local alive_count; alive_count=$(grep -c . "$sorted_file" 2>/dev/null || echo 0)
+
+    local keep_count
+    case "$check_mode" in
+        fastest) keep_count=1 ;;
+        5)       keep_count=5 ;;
+        10)      keep_count=10 ;;
+        20)      keep_count=20 ;;
+        all|*)   keep_count="$alive_count" ;;
+    esac
+    [ "$keep_count" -gt "$alive_count" ] && keep_count="$alive_count"
+
+    local good_list; good_list=$(create_temp_file)
+    echo "[]" > "$good_list"
+    local temp_results; temp_results=$(create_temp_file)
+    local kept=0
+
+    while IFS=' ' read -r delay_padded entry_b64; do
+        [ -z "$entry_b64" ] && continue
+        [ "$kept" -ge "$keep_count" ] && break
+        local entry_json; entry_json=$(printf '%s' "$entry_b64" | base64 -d 2>/dev/null)
+        jq --argjson e "$entry_json" '. += [$e]' "$good_list" > "$temp_results" && \
+            mv "$temp_results" "$good_list"
+        kept=$((kept + 1))
+    done < "$sorted_file"
+
     cp "$good_list" "$SBSM_DB_FILE"
-    log_info "Check complete: $ok alive, $fail removed, $untagged skipped"
+
+    local removed=$((alive_count - kept))
+    log_info "Check complete: $kept kept (of $alive_count alive), $removed filtered out, $fail dead, $untagged skipped"
     echo ""
-    echo -e "${GREEN}Results:${NC} $ok alive, ${RED}$fail removed${NC}, ${DGRAY}$untagged skipped${NC}"
+    echo -e "${GREEN}Results:${NC} $kept kept (of $alive_count alive), ${YELLOW}$removed filtered${NC} by mode '$check_mode', ${RED}$fail dead${NC}, ${DGRAY}$untagged skipped${NC}"
     return 0
 }
 
@@ -957,6 +1016,8 @@ usage() {
     echo "  mode [MODE]    Get/set mode: by_country, russia_inside, subscription"
     echo "  sb_mode [MODE] Get/set sb_mode: tun, tproxy_fakeip"
     echo "  ru_srs [URLs]  Get/set custom RU SRS rule URLs"
+    echo "  check_mode [M] Get/set checking mode: fastest, 5, 10, 20, all"
+    echo "  check_url [U]  Get/set check URL for proxy testing"
     echo "  subs list/add  Manage subscriptions"
     echo "  menu           Interactive menu (default)"
     echo "  help           Show this help"
@@ -965,7 +1026,7 @@ usage() {
 
 show_menu() {
     while true; do
-        clear; echo -e "${CYAN}=== SBSM Extended v0.5.0 ===${NC}"; echo ""
+        clear; echo -e "${CYAN}=== SBSM Extended v0.5.1 ===${NC}"; echo ""
         local pc=$(jq 'length' "$SBSM_DB_FILE" 2>/dev/null || echo 0)
         echo -e "Proxies: ${GREEN}$pc${NC}  Mode: ${YELLOW}$(get_mode)${NC}  SB: ${YELLOW}$(get_sb_mode)${NC}"; echo ""
         echo "1. Update Subscriptions (fetch + build + restart)"
@@ -984,17 +1045,47 @@ show_menu() {
 _settings_menu() {
     while true; do
         clear; echo -e "${CYAN}=== Settings ===${NC}"; echo ""
-        echo "Mode: $(get_mode)"; echo "Sing-Box Mode: $(get_sb_mode)"; subs_list; echo ""
-        echo "1. Change Grouping Mode (by_country/russia_inside/subscription)"
+        echo "Group Mode: $(get_mode)"; echo "Sing-Box Mode: $(get_sb_mode)"
+        echo "Check Mode: $(get_check_mode) | Check URL: $(get_check_url)"
+        subs_list; echo ""
+        echo "1. Change Group Mode (by_country/russia_inside/subscription)"
         echo "2. Change Sing-Box Mode (tun/tproxy_fakeip)"
-        echo "3. Add Subscription URL"
-        echo "4. Remove Subscription URL"
+        echo "3. Change Checking Mode"
+        echo "4. Add Subscription URL"
+        echo "5. Remove Subscription URL"
         echo "0. Back"; printf "Choice: "; read -r sc
         case "$sc" in
             1) echo "1. by_country  2. russia_inside  3. subscription"; printf "Mode: "; read -r m; case "$m" in 1) set_mode "by_country";;2) set_mode "russia_inside";;3) set_mode "subscription";;esac ;;
             2) echo "1. tun  2. tproxy_fakeip"; printf "SB Mode: "; read -r m; case "$m" in 1) set_sb_mode "tun";;2) set_sb_mode "tproxy_fakeip";;esac ;;
-            3) printf "URL: "; read -r u; subs_add "$u" ;;
-            4) printf "Number: "; read -r n; subs_remove "$n" ;;
+            3) _check_settings_menu ;;
+            4) printf "URL: "; read -r u; subs_add "$u" ;;
+            5) printf "Number: "; read -r n; subs_remove "$n" ;;
+            0) break ;;
+        esac; echo "Press Enter..."; read -r _
+    done
+}
+
+_check_settings_menu() {
+    while true; do
+        clear; echo -e "${CYAN}=== Checking Mode Settings ===${NC}"; echo ""
+        echo "Current check mode: $(get_check_mode)"
+        echo "Current check URL:  $(get_check_url)"
+        echo ""
+        echo "1. Fastest (1 proxy with lowest ping)"
+        echo "2. Top 5 fastest proxies"
+        echo "3. Top 10 fastest proxies"
+        echo "4. Top 20 fastest proxies"
+        echo "5. All (keep all alive proxies)"
+        echo "6. Change Check URL"
+        echo "0. Back"
+        printf "Choice [0-6]: "; read -r cm
+        case "$cm" in
+            1) set_check_mode "fastest"; echo "Set: fastest" ;;
+            2) set_check_mode "5"; echo "Set: top 5" ;;
+            3) set_check_mode "10"; echo "Set: top 10" ;;
+            4) set_check_mode "20"; echo "Set: top 20" ;;
+            5) set_check_mode "all"; echo "Set: all" ;;
+            6) printf "New URL: "; read -r new_url; set_check_url "$new_url"; echo "Set: $new_url" ;;
             0) break ;;
         esac; echo "Press Enter..."; read -r _
     done
@@ -1048,6 +1139,8 @@ main() {
         mode)    if [ -z "${2:-}" ]; then get_mode; else set_mode "$2"; fi ;;
         sb_mode) if [ -z "${2:-}" ]; then get_sb_mode; else set_sb_mode "$2"; fi ;;
         ru_srs)  if [ -z "${2:-}" ]; then get_ru_srs; else set_ru_srs "$2"; fi ;;
+        check_mode) init_config; [ -n "$2" ] && set_check_mode "$2"; get_check_mode ;;
+        check_url)  init_config; [ -n "$2" ] && set_check_url "$2"; get_check_url ;;
         subs)
             case "${2:-list}" in
                 list) subs_list ;; add) subs_add "${3:-}" ;; remove) subs_remove "${3:-}" ;;

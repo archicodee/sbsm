@@ -2,7 +2,7 @@
 # =============================================================================
 # SBSM (Sing-Box Subscription Manager) - Podkop Edition
 # Description: Manage proxy subscriptions for Sing-Box + Podkop on OpenWRT
-# Version: 0.5.0
+# Version: 0.5.1
 # =============================================================================
 
 # =============================================================================
@@ -136,8 +136,11 @@ SBSM_CONF_FILE="${SBSM_CONF_FILE:-/etc/sing-box/sbsm.conf}"
 cfg_get_raw() {
     local section="$1" key="$2"
     [ -f "$SBSM_CONF_FILE" ] && awk -v sec="$section" -v k="$key" '
-        /^\[/ { cur = substr($0, 2, length($0)-2) }
-        cur == sec { idx = index($0, "="); if (idx > 0) { ck = substr($0, 1, idx-1); gsub(/[[:space:]]/, "", ck); if (ck == k) { print substr($0, idx+1); exit } } }
+        /^\[/ { cur = substr($0, 2, length($0)-2); in_sec = (cur == sec); next }
+        in_sec && index($0, "=") > 0 {
+            idx = index($0, "="); ck = substr($0, 1, idx-1); gsub(/[[:space:]]/, "", ck)
+            if (ck == k) { print substr($0, idx+1); exit }
+        }
     ' "$SBSM_CONF_FILE" 2>/dev/null
 }
 
@@ -147,16 +150,29 @@ cfg_set() {
     local section="$1" key="$2" value="$3" tmp="${SBSM_CONF_FILE}.tmp"
     [ ! -f "$SBSM_CONF_FILE" ] && { printf '[%s]\n%s=%s\n' "$section" "$key" "$value" > "$SBSM_CONF_FILE"; return 0; }
     grep -q "^\[$section\]$" "$SBSM_CONF_FILE" 2>/dev/null || { printf '\n[%s]\n%s=%s\n' "$section" "$key" "$value" >> "$SBSM_CONF_FILE"; return 0; }
-    if grep -A999 "^\[$section\]$" "$SBSM_CONF_FILE" 2>/dev/null | grep -q "^${key}="; then
+    # Check if key exists within THIS section only
+    local key_in_section=0
+    key_in_section=$(awk -v sec="$section" -v k="$key" '
+        /^\[/ { cur = substr($0, 2, length($0)-2); in_sec = (cur == sec); next }
+        in_sec && index($0, "=") > 0 {
+            idx = index($0, "="); ck = substr($0, 1, idx-1); gsub(/[[:space:]]/, "", ck)
+            if (ck == k) { print 1; exit }
+        }
+    ' "$SBSM_CONF_FILE" 2>/dev/null)
+    if [ "$key_in_section" = "1" ]; then
         awk -v sec="$section" -v k="$key" -v v="$value" '
-            /^\[/ { cur = substr($0, 2, length($0)-2) }
-            cur == sec { idx = index($0, "="); if (idx > 0) { ck = substr($0, 1, idx-1); gsub(/[[:space:]]/, "", ck); if (ck == k) { printf "%s=%s\n", k, v; next } } }
+            /^\[/ { cur = substr($0, 2, length($0)-2); in_sec = (cur == sec) }
+            in_sec && index($0, "=") > 0 {
+                idx = index($0, "="); ck = substr($0, 1, idx-1); gsub(/[[:space:]]/, "", ck)
+                if (ck == k) { printf "%s=%s\n", k, v; next }
+            }
             { print }
         ' "$SBSM_CONF_FILE" > "$tmp" && mv "$tmp" "$SBSM_CONF_FILE"
     else
+        # Key not in section — append after section header
         awk -v sec="$section" -v k="$key" -v v="$value" '
-            /^\[/ { cur = substr($0, 2, length($0)-2) }
             { print }
+            /^\[/ { cur = substr($0, 2, length($0)-2) }
             cur == sec && !done { print k "=" v; done = 1 }
         ' "$SBSM_CONF_FILE" > "$tmp" && mv "$tmp" "$SBSM_CONF_FILE"
     fi
@@ -167,10 +183,14 @@ cfg_init() {
     cat > "$SBSM_CONF_FILE" <<'EOF'
 [sbsm_podkop]
 mode=by_country
+check_url=https://www.gstatic.com/generate_204
+check_mode=all
 
 [sbsm_extended]
 mode=by_country
 sb_mode=tun
+check_url=https://www.gstatic.com/generate_204
+check_mode=all
 EOF
 }
 
@@ -184,6 +204,15 @@ init_config() {
 
 get_mode() { cfg_get "sbsm_podkop" "mode" "by_country"; }
 set_mode() { cfg_set "sbsm_podkop" "mode" "$1"; }
+get_check_url() { cfg_get "sbsm_podkop" "check_url" "https://www.gstatic.com/generate_204"; }
+set_check_url() { cfg_set "sbsm_podkop" "check_url" "$1"; }
+get_check_mode() { cfg_get "sbsm_podkop" "check_mode" "all"; }
+set_check_mode() {
+    case "$1" in
+        fastest|5|10|20|all) cfg_set "sbsm_podkop" "check_mode" "$1" ;;
+        *) log_error "Invalid check_mode: $1 (use: fastest, 5, 10, 20, all)"; return 1 ;;
+    esac
+}
 
 restart_target() {
     if [ -x "/etc/init.d/podkop" ]; then
@@ -850,7 +879,6 @@ fetch_subscriptions() {
 # F. Proxy Availability Check (via sing-box)
 # =============================================================================
 
-SBSM_TEST_URL="https://www.gstatic.com/generate_204"
 SBSM_TEST_TIMEOUT="${SBSM_TEST_TIMEOUT:-5000}"
 
 # _parse_host_port() - Extract host:port from proxy URL
@@ -922,6 +950,8 @@ _ensure_singbox_running() {
 
 check_remove_unavailable() {
     local db_file="$SBSM_DB_FILE"
+    local check_url; check_url=$(get_check_url)
+    local check_mode; check_mode=$(get_check_mode)
 
     local total
     total=$(jq 'length' "$db_file" 2>/dev/null || echo 0)
@@ -931,13 +961,12 @@ check_remove_unavailable() {
         return 0
     fi
 
-    log_info "Checking $total proxies via sing-box..."
-    echo -e "${MAGENTA}Checking $total proxies${NC} (sing-box proxy test)..."
+    log_info "Checking $total proxies via sing-box (mode=$check_mode, url=$check_url)..."
+    echo -e "${MAGENTA}Checking $total proxies${NC} (mode=${YELLOW}$check_mode${NC}, url=${CYAN}${check_url}${NC})..."
 
     _ensure_singbox_running
 
-    local api_base=""
-    local use_api=0
+    local api_base="" use_api=0
     api_base=$(_get_clash_api_addr)
     if [ -n "$api_base" ]; then
         if curl -s --max-time 3 "${api_base}/version" >/dev/null 2>&1; then
@@ -958,33 +987,25 @@ check_remove_unavailable() {
         echo -e "  ${CYAN}Method: sing-box tools fetch${NC}"
     fi
 
-    local tag_map
-    tag_map=$(create_temp_file)
+    local tag_map; tag_map=$(create_temp_file)
     _build_tag_map "$SBSM_CONFIG_FILE" > "$tag_map"
 
-    local good_list
-    good_list=$(create_temp_file)
-    echo "[]" > "$good_list"
-
-    local ok=0 fail=0 untagged=0
-    local temp_results
-    temp_results=$(create_temp_file)
+    # Collect results: each line = "delay entry_base64"
+    local results_file; results_file=$(create_temp_file)
+    : > "$results_file"
+    local fail=0 untagged=0
 
     local index=0
     while [ "$index" -lt "$total" ]; do
         local entry url remark
-
         entry=$(jq -r ".[$index] | @base64" "$db_file" 2>/dev/null)
         [ -z "$entry" ] && { index=$((index + 1)); continue; }
 
         url=$(printf '%s' "$entry" | base64 -d 2>/dev/null | jq -r '.url' 2>/dev/null)
         remark=$(printf '%s' "$entry" | base64 -d 2>/dev/null | jq -r '.remark' 2>/dev/null | cut -c1-40)
 
-        local host_port
-        host_port=$(_parse_host_port "$url")
-
-        local tag
-        tag=$(_find_tag_by_host_port "$tag_map" "$host_port")
+        local host_port; host_port=$(_parse_host_port "$url")
+        local tag; tag=$(_find_tag_by_host_port "$tag_map" "$host_port")
 
         printf '  Testing %-42s ' "${remark}..."
 
@@ -995,14 +1016,13 @@ check_remove_unavailable() {
             continue
         fi
 
-        local alive=0
+        local delay=""
         if [ "$use_api" -eq 1 ]; then
-            local api_result delay
+            local api_result
             api_result=$(curl -s --max-time 10 \
-                "${api_base}/proxies/${tag}/delay?timeout=${SBSM_TEST_TIMEOUT}&url=${SBSM_TEST_URL}" 2>/dev/null)
+                "${api_base}/proxies/${tag}/delay?timeout=${SBSM_TEST_TIMEOUT}&url=${check_url}" 2>/dev/null)
             if [ -n "$api_result" ] && printf '%s' "$api_result" | grep -q '"delay"'; then
                 delay=$(printf '%s' "$api_result" | jq -r '.delay' 2>/dev/null)
-                alive=1
                 printf "${GREEN}OK${NC} ${DGRAY}(%sms)${NC}\n" "$delay"
             else
                 printf "${RED}FAIL${NC}\n"
@@ -1010,31 +1030,62 @@ check_remove_unavailable() {
         else
             rm -f /tmp/sing-box/cache.db 2>/dev/null
             if sing-box -c "$SBSM_CONFIG_FILE" tools fetch \
-                --outbound "$tag" "$SBSM_TEST_URL" >/dev/null 2>/dev/null; then
-                alive=1
+                --outbound "$tag" "$check_url" >/dev/null 2>/dev/null; then
+                delay="0"
                 printf "${GREEN}OK${NC}\n"
             else
                 printf "${RED}FAIL${NC}\n"
             fi
         fi
 
-        if [ "$alive" -eq 1 ]; then
-            local entry_json
-            entry_json=$(printf '%s' "$entry" | base64 -d 2>/dev/null)
-            jq --argjson e "$entry_json" '. += [$e]' "$good_list" > "$temp_results" && \
-                mv "$temp_results" "$good_list"
-            ok=$((ok + 1))
+        if [ -n "$delay" ]; then
+            # Store delay + entry for sorting (delay as integer for sort)
+            local delay_int; delay_int=$(printf '%s' "$delay" | sed 's/[^0-9]//g')
+            [ -z "$delay_int" ] && delay_int="99999"
+            printf '%05d %s\n' "$delay_int" "$entry" >> "$results_file"
         else
             fail=$((fail + 1))
         fi
         index=$((index + 1))
     done
 
+    # Sort by delay (ascending) and apply check_mode filter
+    local sorted_file; sorted_file=$(create_temp_file)
+    sort -n "$results_file" > "$sorted_file"
+
+    local alive_count; alive_count=$(grep -c . "$sorted_file" 2>/dev/null || echo 0)
+
+    local keep_count
+    case "$check_mode" in
+        fastest) keep_count=1 ;;
+        5)       keep_count=5 ;;
+        10)      keep_count=10 ;;
+        20)      keep_count=20 ;;
+        all|*)   keep_count="$alive_count" ;;
+    esac
+    [ "$keep_count" -gt "$alive_count" ] && keep_count="$alive_count"
+
+    # Build filtered DB
+    local good_list; good_list=$(create_temp_file)
+    echo "[]" > "$good_list"
+    local temp_results; temp_results=$(create_temp_file)
+    local kept=0
+
+    while IFS=' ' read -r delay_padded entry_b64; do
+        [ -z "$entry_b64" ] && continue
+        [ "$kept" -ge "$keep_count" ] && break
+        local entry_json; entry_json=$(printf '%s' "$entry_b64" | base64 -d 2>/dev/null)
+        jq --argjson e "$entry_json" '. += [$e]' "$good_list" > "$temp_results" && \
+            mv "$temp_results" "$good_list"
+        kept=$((kept + 1))
+    done < "$sorted_file"
+
     cp "$good_list" "$SBSM_DB_FILE"
 
-    log_info "Check complete: $ok alive, $fail removed, $untagged skipped"
+    local removed=$((alive_count - kept))
+    log_info "Check complete: $kept kept (of $alive_count alive), $removed filtered out, $fail dead, $untagged skipped"
     echo ""
-    echo -e "${GREEN}Results:${NC} $ok alive, ${RED}$fail removed${NC}, ${DGRAY}$untagged skipped${NC}"
+    echo -e "${GREEN}Results:${NC} $kept kept (of $alive_count alive), ${YELLOW}$removed filtered${NC} by mode '$check_mode', ${RED}$fail dead${NC}, ${DGRAY}$untagged skipped${NC}"
 
     return 0
 }
@@ -1318,7 +1369,7 @@ show_menu() {
         clear
         echo -e "╔════════════════════════════════════════════════════╗"
         echo -e "║  ${BLUE}SBSM — Sing-Box Subscription Manager${NC}              ║"
-        echo -e "║  ${BLUE}Podkop Edition${NC}                      ${DGRAY}v0.5.0${NC}        ║"
+        echo -e "║  ${BLUE}Podkop Edition${NC}                      ${DGRAY}v0.5.1${NC}        ║"
         echo -e "╚════════════════════════════════════════════════════╝"
         local sb_ver="Unknown"
         command -v sing-box >/dev/null 2>&1 && sb_ver=$(sing-box version 2>/dev/null | head -n1)
@@ -1347,12 +1398,14 @@ show_settings_menu() {
     while true; do
         clear
         echo "=== Settings ==="
-        echo "Mode: $(get_mode)"
+        echo "Group Mode: $(get_mode)"
+        echo "Check Mode: $(get_check_mode) | Check URL: $(get_check_url)"
         echo ""
         echo "1. Manage Subscriptions"
-        echo "2. Change Mode"
+        echo "2. Change Group Mode"
+        echo "3. Change Checking Mode"
         echo "0. Back"
-        printf "Choice [0-2]: "; read -r sc
+        printf "Choice [0-3]: "; read -r sc
         case "$sc" in
             1)
                 while true; do
@@ -1366,8 +1419,37 @@ show_settings_menu() {
                 echo "Available: 1. Russia Inside | 2. Group by Country | 3. Subscription"
                 printf "Enter (1-3): "; read -r m
                 case "$m" in 1) set_mode "russia_inside" ;; 2) set_mode "by_country" ;; 3) set_mode "subscription" ;; esac ;;
+            3) _check_settings_menu ;;
             0) break ;;
         esac
+    done
+}
+
+_check_settings_menu() {
+    while true; do
+        clear
+        echo "=== Checking Mode Settings ==="
+        echo "Current check mode: $(get_check_mode)"
+        echo "Current check URL:  $(get_check_url)"
+        echo ""
+        echo "1. Fastest (1 proxy with lowest ping)"
+        echo "2. Top 5 fastest proxies"
+        echo "3. Top 10 fastest proxies"
+        echo "4. Top 20 fastest proxies"
+        echo "5. All (keep all alive proxies)"
+        echo "6. Change Check URL"
+        echo "0. Back"
+        printf "Choice [0-6]: "; read -r cm
+        case "$cm" in
+            1) set_check_mode "fastest"; echo "Set: fastest" ;;
+            2) set_check_mode "5"; echo "Set: top 5" ;;
+            3) set_check_mode "10"; echo "Set: top 10" ;;
+            4) set_check_mode "20"; echo "Set: top 20" ;;
+            5) set_check_mode "all"; echo "Set: all" ;;
+            6) printf "New URL: "; read -r new_url; set_check_url "$new_url"; echo "Set: $new_url" ;;
+            0) break ;;
+        esac
+        echo "Press Enter..."; read -r _
     done
 }
 
@@ -1376,7 +1458,7 @@ show_settings_menu() {
 # =============================================================================
 
 usage() {
-    echo "Usage: $0 {fetch|check|sync|update|validate|mode|status|log|menu}"
+    echo "Usage: $0 {fetch|check|sync|update|validate|mode|check_mode|check_url|status|log|menu}"
     exit 0
 }
 
@@ -1389,6 +1471,8 @@ main() {
         sync)  dependency_check && init_config && manage_uci && restart_target ;;
         update) dependency_check && init_config && fetch_subscriptions && manage_uci && restart_target ;;
         mode)   init_config; [ -n "$2" ] && set_mode "$2"; get_mode ;;
+        check_mode) init_config; [ -n "$2" ] && set_check_mode "$2"; get_check_mode ;;
+        check_url)  init_config; [ -n "$2" ] && set_check_url "$2"; get_check_url ;;
         validate) dependency_check && init_config && cmd_validate ;;
         status)
             echo "Sing-Box: $(command -v sing-box >/dev/null && sing-box version | head -n1 || echo 'NOT FOUND')"
