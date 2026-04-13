@@ -2,7 +2,7 @@
 # =============================================================================
 # SBSM (Sing-Box Subscription Manager) - Podkop Edition
 # Description: Manage proxy subscriptions for Sing-Box + Podkop on OpenWRT
-# Version: 0.5.1
+# Version: 0.6.0
 # =============================================================================
 
 # =============================================================================
@@ -80,6 +80,12 @@ create_temp_file() {
 }
 
 cleanup_temp_files() {
+    # Kill check sing-box instance if running
+    if [ -f /tmp/sbsm_check.pid ]; then
+        kill "$(cat /tmp/sbsm_check.pid)" 2>/dev/null
+        rm -f /tmp/sbsm_check.pid
+    fi
+    # Note: /tmp/sbsm_check.json and /tmp/sbsm_check.log are cleaned by _stop_check_singbox()
     for f in $SBSM_TEMP_FILES; do
         rm -f "$f" 2>/dev/null
     done
@@ -896,74 +902,256 @@ fetch_subscriptions() {
 # =============================================================================
 
 SBSM_TEST_TIMEOUT="${SBSM_TEST_TIMEOUT:-5000}"
+SBSM_CHECK_API_PORT="${SBSM_CHECK_API_PORT:-9091}"
 
-# _parse_host_port() - Extract host:port from proxy URL
-# Arguments: $1=proxy URL
-# Returns: "host:port" string
-_parse_host_port() {
-    local url="$1"
-    local host_port
-    host_port=$(printf '%s' "$url" | sed -n 's|.*://[^@]*@\([^/?#]*\).*|\1|p')
-    [ -z "$host_port" ] && host_port=$(printf '%s' "$url" | sed -n 's|.*://\([^/?#]*\).*|\1|p')
-    printf '%s' "$host_port"
+# url_to_json() - Convert proxy URL to sing-box outbound JSON
+# Supports: vless, ss, trojan, hy2, socks, vmess, tuic, http/https
+# Arguments: $1=proxy URL, $2=index (for unique tag suffix)
+# Returns: JSON string on stdout, exit 1 on parse failure
+url_to_json() {
+    local url="$1" proto="${1%%://*}" body="${1#*://}"
+    local main; main=$(printf '%s' "$body" | sed 's/[?#].*//')
+    local query; query=$(printf '%s' "$body" | sed -n 's/^[^?]*\?//p' | sed 's/#.*//')
+    local user host port remark; remark="${body##*#}"; [ "$remark" = "$body" ] && remark=""
+    local tag; tag=$(printf '%s' "$remark" | sed 's/%F0%9F%87%[0-9A-Fa-f][0-9A-Fa-f]%F0%9F%87%[0-9A-Fa-f][0-9A-Fa-f]//g;s/%20/ /g;s/%2C/,/g;s/%7C/|/g;s/%5B/[/g;s/%5D/]/g' | sed 's/[^A-Za-z0-9 _-]//g' | cut -c1-20)
+    [ -z "$tag" ] && tag="proxy"
+    tag="${tag}-${2:-0}"
+    local user_host_port="${main}"; host_port="${user_host_port#*@}"; user="${user_host_port%@*}"
+    [ "$host_port" = "$user_host_port" ] && { user=""; host_port="$user_host_port"; }
+    host="${host_port%:*}"; port="${host_port#*:}"; [ "$port" = "$host_port" ] && port=""
+    port=$(printf '%s' "$port" | sed 's/\/.*//')
+    [ -z "$port" ] && return 1
+    case "$proto" in
+        vless)
+            local flow=$(printf '%s' "$query" | grep -oE 'flow=[^&]*' | cut -d= -f2)
+            local security=$(printf '%s' "$query" | grep -oE 'security=[^&]*' | cut -d= -f2)
+            local transport=$(printf '%s' "$query" | grep -oE 'type=[^&]*' | cut -d= -f2)
+            [ -z "$transport" ] && transport=$(printf '%s' "$query" | grep -oE 'transport=[^&]*' | cut -d= -f2)
+            local sni=$(printf '%s' "$query" | grep -oE 'sni=[^&]*' | cut -d= -f2)
+            local fp=$(printf '%s' "$query" | grep -oE 'fp=[^&]*' | cut -d= -f2)
+            local pbk=$(printf '%s' "$query" | grep -oE 'pbk=[^&]*' | cut -d= -f2)
+            local sid=$(printf '%s' "$query" | grep -oE 'sid=[^&]*' | cut -d= -f2)
+            local path=$(printf '%s' "$query" | grep -oE 'path=[^&]*' | cut -d= -f2 | sed 's/%2F/\//g;s/%3F/?/g;s/%3D/=/g;s/%26/\&/g')
+            local host_param=$(printf '%s' "$query" | grep -oE 'host=[^&]*' | cut -d= -f2)
+            local service_name=$(printf '%s' "$query" | grep -oE 'serviceName=[^&]*' | cut -d= -f2)
+
+            local json=$(jq -n --arg tr "$transport" --arg h "$host" --arg p "$port" --arg u "$user" --arg tag "$tag" \
+                '{"type":"vless","tag":$tag,"server":$h,"server_port":($p|tonumber),"uuid":$u}')
+            [ -n "$flow" ] && json=$(printf '%s' "$json" | jq --arg f "$flow" '.flow=$f')
+
+            local tls_json="{}"
+            [ "$security" = "tls" ] && tls_json=$(jq -n --arg sni "$sni" --arg fp "$fp" '{"enabled":true,"server_name":$sni,"utls":{"enabled":true,"fingerprint":$fp}}')
+            [ "$security" = "reality" ] && tls_json=$(jq -n --arg sni "$sni" --arg fp "$fp" --arg pbk "$pbk" --arg sid "$sid" \
+                '{"enabled":true,"server_name":$sni,"utls":{"enabled":true,"fingerprint":$fp},"reality":{"enabled":true,"public_key":$pbk,"short_id":$sid}}')
+            [ "$security" != "none" ] && [ -n "$security" ] && json=$(printf '%s' "$json" | jq --argjson tls "$tls_json" '.tls=$tls')
+
+            local transport_json="{}"
+            case "$transport" in
+                ws) transport_json=$(jq -n --arg p "$path" --arg h "$host_param" '{"type":"ws","path":$p,"headers":{"Host":$h}}') ;;
+                grpc) transport_json=$(jq -n --arg s "$service_name" '{"type":"grpc","service_name":$s}') ;;
+                httpupgrade) transport_json=$(jq -n --arg p "$path" --arg h "$host_param" '{"type":"httpupgrade","path":$p,"host":$h}') ;;
+            esac
+            [ "$transport" != "tcp" ] && [ "$transport" != "" ] && json=$(printf '%s' "$json" | jq --argjson t "$transport_json" '.transport=$t')
+            printf '%s' "$json" ;;
+        ss)
+            # Skip SS with plugin (v2ray-plugin, simple-obfs)
+            if printf '%s' "$url" | grep -qi 'plugin='; then
+                return 1
+            fi
+            local method_pass; [ -n "$user" ] && method_pass=$(printf '%s' "$user" | base64 -d 2>/dev/null)
+            local method="${method_pass%:*}"; local password="${method_pass#*:}"
+            [ -z "$method" ] || [ -z "$password" ] && return 1
+            jq -n --arg h "$host" --arg p "$port" --arg m "$method" --arg pw "$password" --arg tag "$tag" \
+                '{"type":"shadowsocks","tag":$tag,"server":$h,"server_port":($p|tonumber),"method":$m,"password":$pw}' ;;
+        trojan)
+            local sni=$(printf '%s' "$query" | grep -oE 'sni=[^&]*' | cut -d= -f2)
+            jq -n --arg h "$host" --arg p "$port" --arg pw "$user" --arg tag "$tag" --arg sni "$sni" \
+                '{"type":"trojan","tag":$tag,"server":$h,"server_port":($p|tonumber),"password":$pw,"tls":{"enabled":true,"server_name":$sni}}' ;;
+        hy2|hysteria2)
+            local pw="$user"; local sni=$(printf '%s' "$query" | grep -oE 'sni=[^&]*' | cut -d= -f2)
+            local insecure=$(printf '%s' "$query" | grep -oE 'insecure=[^&]*' | cut -d= -f2)
+            local obfs=$(printf '%s' "$query" | grep -oE 'obfs=[^&]*' | cut -d= -f2)
+            local obfs_pw=$(printf '%s' "$query" | grep -oE 'obfs-password=[^&]*' | cut -d= -f2)
+            local json=$(jq -n --arg h "$host" --arg p "$port" --arg pw "$pw" --arg tag "$tag" \
+                '{"type":"hysteria2","tag":$tag,"server":$h,"server_port":($p|tonumber),"password":$pw}')
+            local tls_json=$(jq -n --arg sni "$sni" '{"enabled":true,"server_name":$sni}')
+            [ "$insecure" = "1" ] && tls_json=$(printf '%s' "$tls_json" | jq '.insecure=true')
+            json=$(printf '%s' "$json" | jq --argjson tls "$tls_json" '.tls=$tls')
+            [ -n "$obfs" ] && [ "$obfs" != "none" ] && json=$(printf '%s' "$json" | jq --arg t "$obfs" --arg op "$obfs_pw" '.obfs={"type":$t,"password":$op}')
+            printf '%s' "$json" ;;
+        socks5|socks4a|socks4)
+            local version="5"; [ "$proto" = "socks4" ] || [ "$proto" = "socks4a" ] && version="4"
+            local user_p="${user%:*}"; local pass_p="${user#*:}"
+            local json=$(jq -n --arg h "$host" --arg p "$port" --arg tag "$tag" --arg v "$version" \
+                '{"type":"socks","tag":$tag,"server":$h,"server_port":($p|tonumber),"version":$v}')
+            [ -n "$user_p" ] && json=$(printf '%s' "$json" | jq --arg u "$user_p" --arg pw "$pass_p" '.username=$u|.password=$pw')
+            printf '%s' "$json" ;;
+        vmess)
+            local vmess_body; vmess_body="${url#vmess://}"
+            vmess_body=$(printf '%s' "$vmess_body" | sed 's/[?#].*//')
+            local vmess_decoded; vmess_decoded=$(printf '%s' "$vmess_body" | base64 -d 2>/dev/null)
+            [ -z "$vmess_decoded" ] && return 1
+            local vmess_host; vmess_host=$(printf '%s' "$vmess_decoded" | jq -r '.add // empty')
+            local vmess_port; vmess_port=$(printf '%s' "$vmess_decoded" | jq -r '.port // empty')
+            local vmess_uuid; vmess_uuid=$(printf '%s' "$vmess_decoded" | jq -r '.id // empty')
+            [ -z "$vmess_host" ] || [ -z "$vmess_port" ] || [ -z "$vmess_uuid" ] && return 1
+            local vmess_net; vmess_net=$(printf '%s' "$vmess_decoded" | jq -r '.net // "tcp"')
+            local vmess_tls; vmess_tls=$(printf '%s' "$vmess_decoded" | jq -r '.tls // ""')
+            local vmess_sni; vmess_sni=$(printf '%s' "$vmess_decoded" | jq -r '.sni // ""')
+            local vmess_alpn; vmess_alpn=$(printf '%s' "$vmess_decoded" | jq -r '.alpn // ""')
+            local vmess_fp; vmess_fp=$(printf '%s' "$vmess_decoded" | jq -r '.fp // ""')
+            local vmess_path; vmess_path=$(printf '%s' "$vmess_decoded" | jq -r '.path // ""')
+            local vmess_host_hdr; vmess_host_hdr=$(printf '%s' "$vmess_decoded" | jq -r '.host // ""')
+            local vmess_service; vmess_service=$(printf '%s' "$vmess_decoded" | jq -r '.path // ""' | sed 's/.*serviceName=//;s/&.*//')
+            [ "$vmess_net" = "grpc" ] && vmess_service=$(printf '%s' "$vmess_decoded" | jq -r '.path // ""')
+            local vmess_aid; vmess_aid=$(printf '%s' "$vmess_decoded" | jq -r '.aid // "0"')
+            local json; json=$(jq -n --arg h "$vmess_host" --arg p "$vmess_port" --arg u "$vmess_uuid" --arg tag "$tag" --arg aid "$vmess_aid" \
+                '{"type":"vmess","tag":$tag,"server":$h,"server_port":($p|tonumber),"uuid":$u,"alter_id":($aid|tonumber),"security":"auto"}')
+            if [ "$vmess_tls" = "tls" ]; then
+                local tls_json; tls_json=$(jq -n --arg sni "$vmess_sni" --arg fp "$vmess_fp" '{"enabled":true,"server_name":$sni,"utls":{"enabled":true,"fingerprint":$fp}}')
+                [ -n "$vmess_alpn" ] && tls_json=$(printf '%s' "$tls_json" | jq --arg a "$vmess_alpn" '.alpn=($a | split(","))')
+                json=$(printf '%s' "$json" | jq --argjson tls "$tls_json" '.tls=$tls')
+            fi
+            case "$vmess_net" in
+                ws)
+                    local t_json; t_json=$(jq -n --arg p "$vmess_path" --arg h "$vmess_host_hdr" '{"type":"ws","path":$p,"headers":{"Host":$h}}')
+                    json=$(printf '%s' "$json" | jq --argjson t "$t_json" '.transport=$t') ;;
+                grpc)
+                    local t_json; t_json=$(jq -n --arg s "$vmess_service" '{"type":"grpc","service_name":$s}')
+                    json=$(printf '%s' "$json" | jq --argjson t "$t_json" '.transport=$t') ;;
+                h2|http)
+                    local t_json; t_json=$(jq -n --arg p "$vmess_path" --arg h "$vmess_host_hdr" '{"type":"http","path":$p,"host":[$h]}')
+                    json=$(printf '%s' "$json" | jq --argjson t "$t_json" '.transport=$t') ;;
+            esac
+            printf '%s' "$json" ;;
+        tuic)
+            local tuic_body; tuic_body="${url#tuic://}"
+            local tuic_main; tuic_main=$(printf '%s' "$tuic_body" | sed 's/[?#].*//')
+            local tuic_user; tuic_user="${tuic_main%%@*}"
+            local tuic_uuid; tuic_uuid="${tuic_user%%:*}"
+            local tuic_pw; tuic_pw="${tuic_user#*:}"
+            [ "$tuic_pw" = "$tuic_user" ] && tuic_pw=""
+            local tuic_hp; tuic_hp="${tuic_main#*@}"
+            local tuic_host; tuic_host="${tuic_hp%:*}"
+            local tuic_port; tuic_port="${tuic_hp#*:}"
+            tuic_port=$(printf '%s' "$tuic_port" | sed 's/\/.*//')
+            [ -z "$tuic_host" ] || [ -z "$tuic_port" ] && return 1
+            local tuic_sni; tuic_sni=$(printf '%s' "$query" | grep -oE 'sni=[^&]*' | cut -d= -f2)
+            local tuic_alpn; tuic_alpn=$(printf '%s' "$query" | grep -oE 'alpn=[^&]*' | cut -d= -f2)
+            local tuic_cc; tuic_cc=$(printf '%s' "$query" | grep -oE 'congestion_control=[^&]*' | cut -d= -f2)
+            local json; json=$(jq -n --arg h "$tuic_host" --arg p "$tuic_port" --arg u "$tuic_uuid" --arg pw "$tuic_pw" --arg tag "$tag" \
+                '{"type":"tuic","tag":$tag,"server":$h,"server_port":($p|tonumber),"uuid":$u,"password":$pw}')
+            [ -n "$tuic_cc" ] && json=$(printf '%s' "$json" | jq --arg c "$tuic_cc" '.congestion_control=$c')
+            local tls_json; tls_json=$(jq -n --arg sni "$tuic_sni" '{"enabled":true,"server_name":$sni}')
+            [ -n "$tuic_alpn" ] && tls_json=$(printf '%s' "$tls_json" | jq --arg a "$tuic_alpn" '.alpn=($a | split(","))')
+            json=$(printf '%s' "$json" | jq --argjson tls "$tls_json" '.tls=$tls')
+            printf '%s' "$json" ;;
+        http|https)
+            local http_body; http_body="${1#*://}"
+            local http_main; http_main=$(printf '%s' "$http_body" | sed 's/[?#].*//')
+            local http_hp; http_hp="${http_main#*@}"
+            [ "$http_hp" = "$http_main" ] && http_hp="$http_main"
+            local http_host; http_host="${http_hp%:*}"
+            local http_port; http_port="${http_hp#*:}"
+            http_port=$(printf '%s' "$http_port" | sed 's/\/.*//')
+            [ -z "$http_host" ] || [ -z "$http_port" ] && return 1
+            local http_user; http_user="${http_main%@*}"
+            [ "$http_user" = "$http_main" ] && http_user=""
+            local http_u; http_u="${http_user%%:*}"
+            local http_pw; http_pw="${http_user#*:}"
+            [ "$http_pw" = "$http_user" ] && http_pw=""
+            local json; json=$(jq -n --arg h "$http_host" --arg p "$http_port" --arg tag "$tag" \
+                '{"type":"http","tag":$tag,"server":$h,"server_port":($p|tonumber)}')
+            [ -n "$http_u" ] && json=$(printf '%s' "$json" | jq --arg u "$http_u" --arg pw "$http_pw" '.username=$u|.password=$pw')
+            [ "$proto" = "https" ] && json=$(printf '%s' "$json" | jq '.tls={"enabled":true}')
+            printf '%s' "$json" ;;
+    esac
 }
 
-# _build_tag_map() - Build mapping from "host:port" to outbound tag
-# Reads sing-box config.json, outputs "host:port tag" lines
-# Arguments: $1=config file path
-_build_tag_map() {
-    local config_file="$1"
-    [ ! -f "$config_file" ] && return 1
-    jq -r '[.outbounds[] | select(.server and .server_port)] | .[] | (.server + ":" + (.server_port | tostring) + " " + .tag)' \
-        "$config_file" 2>/dev/null
-}
+# _generate_check_config() - Generate temporary sing-box config for proxy checking
+# Creates config with ALL proxies from DB as outbounds + clash_api
+# Writes to /tmp/sbsm_check.json (fixed path, NOT in subshell)
+# Arguments: $1=db_file path
+# Returns: 0 on success, 1 on failure
+_generate_check_config() {
+    local db_file="$1"
+    local total; total=$(jq 'length' "$db_file" 2>/dev/null || echo 0)
+    [ "$total" -eq 0 ] && return 1
 
-# _find_tag_by_host_port() - Look up outbound tag by host:port
-# Arguments: $1=tag_map_file, $2=host:port
-# Returns: tag string or empty
-_find_tag_by_host_port() {
-    local map_file="$1" target="$2"
-    [ ! -f "$map_file" ] && { printf ''; return; }
-    grep -E "^${target} " "$map_file" 2>/dev/null | head -1 | sed 's/^[^ ]* //'
-}
+    local check_config="/tmp/sbsm_check.json"
+    local outbounds_file; outbounds_file=$(create_temp_file)
+    echo '[]' > "$outbounds_file"
+    local tmp_out; tmp_out=$(create_temp_file)
 
-# _get_clash_api_addr() - Detect sing-box clash_api address from config
-# Returns: API base URL or empty string
-_get_clash_api_addr() {
-    [ ! -f "$SBSM_CONFIG_FILE" ] && { printf ''; return 1; }
-    local addr
-    addr=$(jq -r '.experimental.clash_api.external_controller // empty' "$SBSM_CONFIG_FILE" 2>/dev/null)
-    [ -z "$addr" ] && { printf ''; return 1; }
-    printf 'http://%s' "$addr"
-}
+    local index=0 valid_count=0
+    while [ "$index" -lt "$total" ]; do
+        local url; url=$(jq -r ".[$index].url" "$db_file" 2>/dev/null)
+        [ -z "$url" ] && { index=$((index + 1)); continue; }
 
-# _ensure_singbox_running() - Ensure sing-box is running
-# Returns: 0=running, 1=could not start
-_ensure_singbox_running() {
-    if [ -x "/etc/init.d/sing-box" ] && /etc/init.d/sing-box status >/dev/null 2>&1; then
-        return 0
-    fi
-    if [ -x "/etc/init.d/podkop" ] && /etc/init.d/podkop status >/dev/null 2>&1; then
-        return 0
-    fi
-    if [ -f "$SBSM_CONFIG_FILE" ]; then
-        if ! sing-box check -c "$SBSM_CONFIG_FILE" >/dev/null 2>&1; then
-            log_error "Cannot start sing-box: config validation failed"
-            return 1
+        local tag="sbsm-${index}"
+        local outbound; outbound=$(url_to_json "$url" "$index")
+        if [ -n "$outbound" ]; then
+            # Override tag to predictable format
+            outbound=$(printf '%s' "$outbound" | jq --arg t "$tag" '.tag=$t')
+            jq --argjson o "$outbound" '. += [$o]' "$outbounds_file" > "$tmp_out" && \
+                mv "$tmp_out" "$outbounds_file"
+            valid_count=$((valid_count + 1))
         fi
-        if [ -x "/etc/init.d/sing-box" ]; then
-            /etc/init.d/sing-box start >/dev/null 2>&1
-        elif [ -x "/etc/init.d/podkop" ]; then
-            /etc/init.d/podkop start >/dev/null 2>&1
-        else
-            sing-box run -c "$SBSM_CONFIG_FILE" &
-        fi
-        sleep 3
-        return 0
+        index=$((index + 1))
+    done
+
+    [ "$valid_count" -eq 0 ] && { log_error "No valid outbounds generated for check config"; return 1; }
+
+    # Add direct outbound
+    jq --argjson o '{"type":"direct","tag":"direct-out"}' '. += [$o]' "$outbounds_file" > "$tmp_out" && \
+        mv "$tmp_out" "$outbounds_file"
+
+    # Build full sing-box config: log + clash_api + outbounds + route
+    # No inbounds needed — we only use clash_api for delay testing
+    jq -n \
+        --arg port "$SBSM_CHECK_API_PORT" \
+        --slurpfile outbounds "$outbounds_file" \
+        '{
+            "log": {"level": "warn"},
+            "experimental": {"clash_api": {"external_controller": ("127.0.0.1:" + $port), "secret": ""}},
+            "outbounds": $outbounds[0],
+            "route": {"rules": [], "final": "direct-out"}
+        }' > "$check_config" 2>/dev/null
+
+    if [ ! -s "$check_config" ]; then
+        log_error "Failed to generate check config"
+        return 1
     fi
-    return 1
+
+    return 0
 }
 
+# _kill_check_singbox() - Kill any running check sing-box process (no file cleanup)
+_kill_check_singbox() {
+    if [ -f /tmp/sbsm_check.pid ]; then
+        local pid; pid=$(cat /tmp/sbsm_check.pid 2>/dev/null)
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null
+            local wait_count=0
+            while kill -0 "$pid" 2>/dev/null && [ "$wait_count" -lt 10 ]; do
+                sleep 1
+                wait_count=$((wait_count + 1))
+            done
+            kill -9 "$pid" 2>/dev/null
+        fi
+        rm -f /tmp/sbsm_check.pid
+    fi
+}
+
+# _stop_check_singbox() - Stop check sing-box AND cleanup all files
+_stop_check_singbox() {
+    _kill_check_singbox
+    rm -f /tmp/sbsm_check.json /tmp/sbsm_check.log 2>/dev/null
+}
+
+# check_remove_unavailable() - Check proxy availability using dedicated sing-box instance
+# Generates temp config with ALL proxies, starts sing-box, tests via clash_api, filters by mode
+# Returns: 0 on success, 1 on failure
 check_remove_unavailable() {
     local db_file="$SBSM_DB_FILE"
     local check_url; check_url=$(get_check_url)
@@ -977,41 +1165,77 @@ check_remove_unavailable() {
         return 0
     fi
 
-    log_info "Checking $total proxies via sing-box (mode=$check_mode, url=$check_url)..."
+    log_info "Checking $total proxies via dedicated sing-box (mode=$check_mode, url=$check_url)..."
     echo -e "${MAGENTA}Checking $total proxies${NC} (mode=${YELLOW}$check_mode${NC}, url=${CYAN}${check_url}${NC})..."
+    echo -e "  ${CYAN}Method: clash_api${NC} (dedicated instance, port ${SBSM_CHECK_API_PORT})"
 
-    _ensure_singbox_running
-
-    local api_base="" use_api=0
-    api_base=$(_get_clash_api_addr)
-    if [ -n "$api_base" ]; then
-        if curl -s --max-time 3 "${api_base}/version" >/dev/null 2>&1; then
-            use_api=1
-            log_info "Using clash_api at $api_base"
-            echo -e "  ${CYAN}Method: clash_api${NC} ($api_base)"
-        fi
-    fi
-
-    if [ "$use_api" -eq 0 ] && [ ! -f "$SBSM_CONFIG_FILE" ]; then
-        log_error "No sing-box config found, cannot test proxies"
-        echo -e "  ${RED}Error: No sing-box config. Run sync first.${NC}"
+    # Generate check config with ALL proxies from DB
+    if ! _generate_check_config "$db_file"; then
+        echo -e "  ${RED}Error: Failed to generate check config.${NC}"
         return 1
     fi
 
-    if [ "$use_api" -eq 0 ]; then
-        log_info "Using sing-box tools fetch"
-        echo -e "  ${CYAN}Method: sing-box tools fetch${NC}"
+    local check_config="/tmp/sbsm_check.json"
+    if [ ! -f "$check_config" ]; then
+        echo -e "  ${RED}Error: Check config not found.${NC}"
+        return 1
     fi
 
-    local tag_map; tag_map=$(create_temp_file)
-    _build_tag_map "$SBSM_CONFIG_FILE" > "$tag_map"
+    # Validate config
+    if ! sing-box check -c "$check_config" >/dev/null 2>&1; then
+        log_error "Check config validation failed"
+        echo -e "  ${RED}Error: Check config validation failed.${NC}"
+        rm -f "$check_config"
+        return 1
+    fi
+
+    # Kill any previous check sing-box instance (but don't delete config!)
+    _kill_check_singbox
+
+    # Start sing-box with check config in background
+    sing-box run -c "$check_config" >/dev/null 2>&1 &
+    CHECK_PID=$!
+    echo "$CHECK_PID" > /tmp/sbsm_check.pid
+
+    log_info "Started check sing-box (PID=$CHECK_PID)"
+    echo -e "  ${DGRAY}Starting sing-box instance...${NC}"
+
+    # Wait for sing-box to start and clash_api to become available
+    local api_base="http://127.0.0.1:${SBSM_CHECK_API_PORT}"
+    local startup_attempts=0
+    local startup_max=10
+    while [ "$startup_attempts" -lt "$startup_max" ]; do
+        if curl -s --max-time 2 "${api_base}/version" >/dev/null 2>&1; then
+            break
+        fi
+        # Check if process died
+        if ! kill -0 "$CHECK_PID" 2>/dev/null; then
+            log_error "Check sing-box process died during startup"
+            echo -e "  ${RED}Error: sing-box process exited unexpectedly.${NC}"
+            rm -f /tmp/sbsm_check.pid
+            rm -f "$check_config"
+            return 1
+        fi
+        startup_attempts=$((startup_attempts + 1))
+        sleep 1
+    done
+
+    if [ "$startup_attempts" -ge "$startup_max" ]; then
+        log_error "clash_api did not become available within ${startup_max}s"
+        echo -e "  ${RED}Error: clash_api not responding.${NC}"
+        _stop_check_singbox
+        rm -f "$check_config"
+        return 1
+    fi
+
+    log_info "clash_api ready at $api_base"
+    echo -e "  ${GREEN}clash_api ready${NC} (${startup_attempts}s)"
 
     # Collect results: each line = "country delay entry_base64"
-    # country is included for by_country mode filtering
     local cur_mode; cur_mode=$(get_mode)
     local results_file; results_file=$(create_temp_file)
     : > "$results_file"
-    local fail=0 untagged=0
+    local fail=0 skipped=0
 
     local index=0
     while [ "$index" -lt "$total" ]; do
@@ -1022,41 +1246,20 @@ check_remove_unavailable() {
         url=$(printf '%s' "$entry" | base64 -d 2>/dev/null | jq -r '.url' 2>/dev/null)
         remark=$(printf '%s' "$entry" | base64 -d 2>/dev/null | jq -r '.remark' 2>/dev/null | cut -c1-40)
 
-        local host_port; host_port=$(_parse_host_port "$url")
-        local tag; tag=$(_find_tag_by_host_port "$tag_map" "$host_port")
+        local tag="sbsm-${index}"
 
         printf '  Testing %-42s ' "${remark}..."
 
-        if [ -z "$tag" ]; then
-            printf "${DGRAY}SKIP${NC} ${DGRAY}(no outbound)${NC}\n"
-            untagged=$((untagged + 1))
-            index=$((index + 1))
-            continue
-        fi
+        # Check if this index was included in the check config (url_to_json succeeded)
+        # Proxies that failed url_to_json conversion are skipped
+        local api_result
+        api_result=$(curl -s --max-time 15 \
+            "${api_base}/proxies/${tag}/delay?timeout=${SBSM_TEST_TIMEOUT}&url=${check_url}" 2>/dev/null)
 
-        local delay=""
-        if [ "$use_api" -eq 1 ]; then
-            local api_result
-            api_result=$(curl -s --max-time 10 \
-                "${api_base}/proxies/${tag}/delay?timeout=${SBSM_TEST_TIMEOUT}&url=${check_url}" 2>/dev/null)
-            if [ -n "$api_result" ] && printf '%s' "$api_result" | grep -q '"delay"'; then
-                delay=$(printf '%s' "$api_result" | jq -r '.delay' 2>/dev/null)
-                printf "${GREEN}OK${NC} ${DGRAY}(%sms)${NC}\n" "$delay"
-            else
-                printf "${RED}FAIL${NC}\n"
-            fi
-        else
-            rm -f /tmp/sing-box/cache.db 2>/dev/null
-            if sing-box -c "$SBSM_CONFIG_FILE" tools fetch \
-                --outbound "$tag" "$check_url" >/dev/null 2>/dev/null; then
-                delay="0"
-                printf "${GREEN}OK${NC}\n"
-            else
-                printf "${RED}FAIL${NC}\n"
-            fi
-        fi
+        if [ -n "$api_result" ] && printf '%s' "$api_result" | grep -q '"delay"'; then
+            local delay; delay=$(printf '%s' "$api_result" | jq -r '.delay' 2>/dev/null)
+            printf "${GREEN}OK${NC} ${DGRAY}(%sms)${NC}\n" "$delay"
 
-        if [ -n "$delay" ]; then
             local delay_int; delay_int=$(printf '%s' "$delay" | sed 's/[^0-9]//g')
             [ -z "$delay_int" ] && delay_int="99999"
             # Determine country for by_country mode
@@ -1066,10 +1269,20 @@ check_remove_unavailable() {
             fi
             printf '%s %05d %s\n' "$country" "$delay_int" "$entry" >> "$results_file"
         else
-            fail=$((fail + 1))
+            # Distinguish between "proxy not in config" and "proxy failed"
+            if printf '%s' "$api_result" | grep -q 'inactive'; then
+                printf "${DGRAY}SKIP${NC} ${DGRAY}(conversion failed)${NC}\n"
+                skipped=$((skipped + 1))
+            else
+                printf "${RED}FAIL${NC}\n"
+                fail=$((fail + 1))
+            fi
         fi
         index=$((index + 1))
     done
+
+    # Stop the check sing-box instance
+    _stop_check_singbox
 
     # Apply check_mode filter
     local alive_count; alive_count=$(grep -c . "$results_file" 2>/dev/null || echo 0)
@@ -1116,9 +1329,9 @@ check_remove_unavailable() {
         done
 
         local alive_countries; alive_countries=$(printf '%s' "$countries" | grep -c . 2>/dev/null || echo 0)
-        log_info "Check complete (by_country): $kept kept across $alive_countries countries, $fail dead, $untagged skipped"
+        log_info "Check complete (by_country): $kept kept across $alive_countries countries, $fail dead, $skipped skipped"
         echo ""
-        echo -e "${GREEN}Results:${NC} $kept kept across ${CYAN}$alive_countries${NC} countries (${YELLOW}$check_mode${NC} per country), ${RED}$fail dead${NC}, ${DGRAY}$untagged skipped${NC}"
+        echo -e "${GREEN}Results:${NC} $kept kept across ${CYAN}$alive_countries${NC} countries (${YELLOW}$check_mode${NC} per country), ${RED}$fail dead${NC}, ${DGRAY}$skipped skipped${NC}"
     else
         # Global filtering (russia_inside, subscription, or check_mode=all)
         local sorted_file; sorted_file=$(create_temp_file)
@@ -1144,9 +1357,9 @@ check_remove_unavailable() {
         done < "$sorted_file"
 
         local removed=$((alive_count - kept))
-        log_info "Check complete: $kept kept (of $alive_count alive), $removed filtered out, $fail dead, $untagged skipped"
+        log_info "Check complete: $kept kept (of $alive_count alive), $removed filtered out, $fail dead, $skipped skipped"
         echo ""
-        echo -e "${GREEN}Results:${NC} $kept kept (of $alive_count alive), ${YELLOW}$removed filtered${NC} by mode '$check_mode', ${RED}$fail dead${NC}, ${DGRAY}$untagged skipped${NC}"
+        echo -e "${GREEN}Results:${NC} $kept kept (of $alive_count alive), ${YELLOW}$removed filtered${NC} by mode '$check_mode', ${RED}$fail dead${NC}, ${DGRAY}$skipped skipped${NC}"
     fi
 
     cp "$good_list" "$SBSM_DB_FILE"
@@ -1464,8 +1677,8 @@ show_menu() {
         case "$choice" in
             1) echo ""; printf "${YELLOW}Clean DB before update? [y/N]:${NC} "; read -r clean_db
                if [ "$clean_db" = "y" ] || [ "$clean_db" = "Y" ]; then cmd_clear_db; fi
-               if fetch_subscriptions; then manage_uci && restart_target && sleep 3 && check_remove_unavailable && manage_uci && remove_empty_sections && restart_target; fi; echo "Press Enter..."; read -r _ ;;
-            2) echo ""; manage_uci && restart_target && sleep 3 && check_remove_unavailable && manage_uci && remove_empty_sections && restart_target; echo "Press Enter..."; read -r _ ;;
+               if fetch_subscriptions; then check_remove_unavailable && manage_uci && remove_empty_sections && restart_target; fi; echo "Press Enter..."; read -r _ ;;
+            2) echo ""; check_remove_unavailable && manage_uci && remove_empty_sections && restart_target; echo "Press Enter..."; read -r _ ;;
             3) show_settings_menu ;;
             4) echo ""; printf "${RED}Remove all proxies from database? [y/N]:${NC} "; read -r confirm
                if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then cmd_clear_db; else echo "Cancelled."; fi; echo "Press Enter..."; read -r _ ;;
@@ -1551,11 +1764,11 @@ main() {
     local cmd="${1:-menu}"
     case "$cmd" in
         fetch) dependency_check && init_config && fetch_subscriptions ;;
-        check) dependency_check && init_config && manage_uci && restart_target && sleep 3 && check_remove_unavailable && manage_uci && remove_empty_sections && restart_target ;;
+        check) dependency_check && init_config && check_remove_unavailable && manage_uci && remove_empty_sections && restart_target ;;
         sync)  dependency_check && init_config && manage_uci && restart_target ;;
         update) dependency_check && init_config
                [ "${2:-}" = "--clean" ] && cmd_clear_db
-               fetch_subscriptions && manage_uci && restart_target && sleep 3 && check_remove_unavailable && manage_uci && remove_empty_sections && restart_target ;;
+               fetch_subscriptions && check_remove_unavailable && manage_uci && remove_empty_sections && restart_target ;;
         mode)   init_config; [ -n "$2" ] && set_mode "$2"; get_mode ;;
         check_mode) init_config; [ -n "$2" ] && set_check_mode "$2"; get_check_mode ;;
         check_url)  init_config; [ -n "$2" ] && set_check_url "$2"; get_check_url ;;
