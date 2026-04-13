@@ -1385,8 +1385,8 @@ show_menu() {
         echo -e "${DGRAY}────────────────────────────────────────────────────${NC}"
         printf "${YELLOW}Choice [0-3]:${NC} "; read -r choice
         case "$choice" in
-            1) echo ""; if fetch_subscriptions; then manage_uci && restart_target; fi; echo "Press Enter..."; read -r _ ;;
-            2) echo ""; manage_uci; restart_target; sleep 3; check_remove_unavailable; manage_uci; remove_empty_sections; restart_target; echo "Press Enter..."; read -r _ ;;
+            1) echo ""; if fetch_subscriptions; then manage_uci && restart_target && sleep 3 && check_remove_unavailable && manage_uci && remove_empty_sections && restart_target; fi; echo "Press Enter..."; read -r _ ;;
+            2) echo ""; manage_uci && restart_target && sleep 3 && check_remove_unavailable && manage_uci && remove_empty_sections && restart_target; echo "Press Enter..."; read -r _ ;;
             3) show_settings_menu ;;
             0) break ;;
             *) echo "Invalid choice."; sleep 1 ;;
@@ -1467,9 +1467,9 @@ main() {
     local cmd="${1:-menu}"
     case "$cmd" in
         fetch) dependency_check && init_config && fetch_subscriptions ;;
-        check) dependency_check && init_config && manage_uci && restart_target && sleep 3 && check_remove_unavailable ;;
+        check) dependency_check && init_config && manage_uci && restart_target && sleep 3 && check_remove_unavailable && manage_uci && remove_empty_sections && restart_target ;;
         sync)  dependency_check && init_config && manage_uci && restart_target ;;
-        update) dependency_check && init_config && fetch_subscriptions && manage_uci && restart_target ;;
+        update) dependency_check && init_config && fetch_subscriptions && manage_uci && restart_target && sleep 3 && check_remove_unavailable && manage_uci && remove_empty_sections && restart_target ;;
         mode)   init_config; [ -n "$2" ] && set_mode "$2"; get_mode ;;
         check_mode) init_config; [ -n "$2" ] && set_check_mode "$2"; get_check_mode ;;
         check_url)  init_config; [ -n "$2" ] && set_check_url "$2"; get_check_url ;;

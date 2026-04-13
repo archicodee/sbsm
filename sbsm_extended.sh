@@ -1034,7 +1034,7 @@ show_menu() {
         echo "3. Settings (mode, sb_mode, subs)"; echo "0. Exit"; echo ""
         printf "Choice: "; read -r c
         case "$c" in
-            1) fetch_subscriptions && manage_json_config && restart_target ;;
+            1) fetch_subscriptions && manage_json_config && restart_target && sleep 3 && check_remove_unavailable && manage_json_config && restart_target ;;
             2) manage_json_config && restart_target ;;
             3) _settings_menu ;;
             0) break ;;
@@ -1125,7 +1125,7 @@ main() {
         fetch)   fetch_subscriptions ;;
         build)   manage_json_config ;;
         check)   manage_json_config && restart_target && sleep 3 && check_remove_unavailable && manage_json_config && restart_target ;;
-        update)  fetch_subscriptions && manage_json_config && restart_target ;;
+        update)  fetch_subscriptions && manage_json_config && restart_target && sleep 3 && check_remove_unavailable && manage_json_config && restart_target ;;
         status)  echo "Proxies: $(jq 'length' "$SBSM_DB_FILE" 2>/dev/null || echo 0)  Mode: $(get_mode)  SB: $(get_sb_mode)" ;;
         validate)
             local total=$(jq 'length' "$SBSM_DB_FILE" 2>/dev/null || echo 0) valid=0 invalid=0 i=0
