@@ -2,7 +2,7 @@
 # =============================================================================
 # SBSM (Sing-Box Subscription Manager) - Extended Edition
 # Description: Manage proxy subscriptions for sing-box extended
-# Version: 0.6.0
+# Version: 0.7.0
 # =============================================================================
 
 # =============================================================================
@@ -194,6 +194,20 @@ set_check_mode() {
     case "$1" in
         fastest|5|10|20|all) cfg_set "sbsm_extended" "check_mode" "$1" ;;
         *) log_error "Invalid check_mode: $1 (use: fastest, 5, 10, 20, all)"; return 1 ;;
+    esac
+}
+get_batch_size() { cfg_get "sbsm_extended" "batch_size" "10"; }
+set_batch_size() {
+    case "$1" in
+        1|2|3|4|5|10|15|20|25|30) cfg_set "sbsm_extended" "batch_size" "$1" ;;
+        *) log_error "Invalid batch_size: $1 (use: 1-30)"; return 1 ;;
+    esac
+}
+get_check_timeout() { cfg_get "sbsm_extended" "check_timeout" "5000"; }
+set_check_timeout() {
+    case "$1" in
+        1000|2000|3000|5000|10000|15000) cfg_set "sbsm_extended" "check_timeout" "$1" ;;
+        *) log_error "Invalid check_timeout: $1 (use: 1000-15000 ms)"; return 1 ;;
     esac
 }
 
@@ -860,12 +874,14 @@ _stop_check_singbox() {
 }
 
 # check_remove_unavailable() - Check proxy availability using dedicated sing-box instance
-# Generates temp config with ALL proxies, starts sing-box, tests via clash_api, filters by mode
+# Generates temp config with ALL proxies, starts sing-box, tests via clash_api in PARALLEL batches
 # Returns: 0 on success, 1 on failure
 check_remove_unavailable() {
     local db_file="$SBSM_DB_FILE"
     local check_url; check_url=$(get_check_url)
     local check_mode; check_mode=$(get_check_mode)
+    local test_timeout; test_timeout=$(get_check_timeout)
+    local batch_size; batch_size=$(get_batch_size)
 
     local total
     total=$(jq 'length' "$db_file" 2>/dev/null || echo 0)
@@ -875,9 +891,10 @@ check_remove_unavailable() {
         return 0
     fi
 
-    log_info "Checking $total proxies via dedicated sing-box (mode=$check_mode, url=$check_url)..."
-    echo -e "${MAGENTA}Checking $total proxies${NC} (mode=${YELLOW}$check_mode${NC}, url=${CYAN}${check_url}${NC})..."
-    echo -e "  ${CYAN}Method: clash_api${NC} (dedicated instance, port ${SBSM_CHECK_API_PORT:-9091})"
+    log_info "Checking $total proxies via dedicated sing-box (mode=$check_mode, url=$check_url, timeout=${test_timeout}ms, batch=$batch_size)..."
+    echo -e "${MAGENTA}Checking $total proxies${NC} (mode=${YELLOW}$check_mode${NC}, url=${CYAN}${check_url}${NC})"
+    echo -e "  ${CYAN}Method:${NC} clash_api (dedicated, port ${SBSM_CHECK_API_PORT})"
+    echo -e "  ${CYAN}Batch:${NC}  ${batch_size} parallel | ${CYAN}Timeout:${NC} ${test_timeout}ms"
 
     # Generate check config with ALL proxies from DB
     if ! _generate_check_config "$db_file"; then
@@ -911,7 +928,7 @@ check_remove_unavailable() {
     echo -e "  ${DGRAY}Starting sing-box instance...${NC}"
 
     # Wait for sing-box to start and clash_api to become available
-    local api_base="http://127.0.0.1:${SBSM_CHECK_API_PORT:-9091}"
+    local api_base="http://127.0.0.1:${SBSM_CHECK_API_PORT}"
     local startup_attempts=0
     local startup_max=10
     while [ "$startup_attempts" -lt "$startup_max" ]; do
@@ -941,61 +958,93 @@ check_remove_unavailable() {
     log_info "clash_api ready at $api_base"
     echo -e "  ${GREEN}clash_api ready${NC} (${startup_attempts}s)"
 
-    # Collect results: each line = "country delay entry_base64"
+    # ---- Parallel clash_api delay testing ----
     local cur_mode; cur_mode=$(get_mode)
     local results_file; results_file=$(create_temp_file)
     : > "$results_file"
     local fail=0 skipped=0
 
-    local index=0
+    local index=0 batch_num=0
     while [ "$index" -lt "$total" ]; do
-        local entry url remark
-        entry=$(jq -r ".[$index] | @base64" "$db_file" 2>/dev/null)
-        [ -z "$entry" ] && { index=$((index + 1)); continue; }
+        batch_num=$((batch_num + 1))
+        local b=0
+        # Launch batch of parallel delay tests
+        while [ "$b" -lt "$batch_size" ] && [ "$index" -lt "$total" ]; do
+            local entry url remark
+            entry=$(jq -r ".[$index] | @base64" "$db_file" 2>/dev/null)
+            local idx="$index"
+            local tag="sbsm-${idx}"
 
-        url=$(printf '%s' "$entry" | base64 -d 2>/dev/null | jq -r '.url' 2>/dev/null)
-        remark=$(printf '%s' "$entry" | base64 -d 2>/dev/null | jq -r '.remark' 2>/dev/null | cut -c1-40)
+            (
+                local api_result
+                api_result=$(curl -s --max-time 15 \
+                    "${api_base}/proxies/${tag}/delay?timeout=${test_timeout}&url=${check_url}" 2>/dev/null)
 
-        local tag="sbsm-${index}"
+                local remark_local
+                remark_local=$(jq -r ".[$idx].remark" "$db_file" 2>/dev/null | cut -c1-40)
 
-        printf '  Testing %-42s ' "${remark}..."
+                if [ -n "$api_result" ] && printf '%s' "$api_result" | grep -q '"delay"'; then
+                    local delay; delay=$(printf '%s' "$api_result" | jq -r '.delay' 2>/dev/null)
+                    local delay_int; delay_int=$(printf '%s' "$delay" | sed 's/[^0-9]//g')
+                    [ -z "$delay_int" ] && delay_int="99999"
+                    local country="_"
+                    if [ "$cur_mode" = "by_country" ]; then
+                        country=$(get_country_from_remark "$remark_local")
+                    fi
+                    local entry_local; entry_local=$(jq -r ".[$idx] | @base64" "$db_file" 2>/dev/null)
+                    printf '%s %05d %s\n' "$country" "$delay_int" "$entry_local" >> "$results_file"
+                    # Write display line to batch output file (avoid printf % issues with URL-encoded chars)
+                    echo "${idx} OK ${delay}" >> "$results_file.display"
+                else
+                    if printf '%s' "$api_result" | grep -q 'inactive'; then
+                        echo "${idx} SKIP 0" >> "$results_file.display"
+                        echo "${idx} SKIP" >> "$results_file.skipped"
+                    else
+                        echo "${idx} FAIL 0" >> "$results_file.display"
+                        echo "${idx} FAIL" >> "$results_file.failed"
+                    fi
+                fi
+            ) &
 
-        # Check if this index was included in the check config (url_to_json succeeded)
-        # Proxies that failed url_to_json conversion are skipped
-        local api_result
-        api_result=$(curl -s --max-time 15 \
-            "${api_base}/proxies/${tag}/delay?timeout=${SBSM_TEST_TIMEOUT:-5000}&url=${check_url}" 2>/dev/null)
+            b=$((b + 1))
+            index=$((index + 1))
+        done
 
-        if [ -n "$api_result" ] && printf '%s' "$api_result" | grep -q '"delay"'; then
-            local delay; delay=$(printf '%s' "$api_result" | jq -r '.delay' 2>/dev/null)
-            printf "${GREEN}OK${NC} ${DGRAY}(%sms)${NC}\n" "$delay"
+        # Wait for batch to complete (polling approach — BusyBox ash "wait" can hang)
+        local batch_expected=$b
+        local batch_ready=0 batch_wait=0
+        while [ "$batch_wait" -lt 30 ]; do
+            batch_ready=$(grep -c . "$results_file.display" 2>/dev/null); : "${batch_ready:=0}"
+            [ "$batch_ready" -ge "$batch_expected" ] && break
+            batch_wait=$((batch_wait + 1))
+            sleep 1
+        done
 
-            local delay_int; delay_int=$(printf '%s' "$delay" | sed 's/[^0-9]//g')
-            [ -z "$delay_int" ] && delay_int="99999"
-            # Determine country for by_country mode
-            local country="_"
-            if [ "$cur_mode" = "by_country" ]; then
-                country=$(get_country_from_remark "$remark")
-            fi
-            printf '%s %05d %s\n' "$country" "$delay_int" "$entry" >> "$results_file"
-        else
-            # Distinguish between "proxy not in config" and "proxy failed"
-            if printf '%s' "$api_result" | grep -q 'inactive'; then
-                printf "${DGRAY}SKIP${NC} ${DGRAY}(conversion failed)${NC}\n"
-                skipped=$((skipped + 1))
-            else
-                printf "${RED}FAIL${NC}\n"
-                fail=$((fail + 1))
-            fi
+        # Print batch results (from subshell display file)
+        if [ -f "$results_file.display" ]; then
+            sort -t' ' -k1 -n "$results_file.display" | while read -r didx dstatus ddelay; do
+                dremark=$(jq -r ".[$didx].remark" "$db_file" 2>/dev/null | cut -c1-40)
+                case "$dstatus" in
+                    OK)   echo -e "  ${dremark}... ${GREEN}OK${NC} ${DGRAY}(${ddelay}ms)${NC}" ;;
+                    SKIP) echo -e "  ${dremark}... ${DGRAY}SKIP${NC} ${DGRAY}(conversion failed)${NC}" ;;
+                    FAIL) echo -e "  ${dremark}... ${RED}FAIL${NC}" ;;
+                esac
+            done
+            # Clear display file for next batch
+            : > "$results_file.display"
         fi
-        index=$((index + 1))
     done
+
+    # Count skipped/failed from subshell files
+    skipped=$(grep -c "SKIP" "$results_file.skipped" 2>/dev/null || echo 0)
+    fail=$(grep -c "FAIL" "$results_file.failed" 2>/dev/null || echo 0)
+    rm -f "$results_file.skipped" "$results_file.failed" "$results_file.display" 2>/dev/null
 
     # Stop the check sing-box instance
     _stop_check_singbox
 
     # Apply check_mode filter
-    local alive_count; alive_count=$(grep -c . "$results_file" 2>/dev/null || echo 0)
+    local alive_count; alive_count=$(grep -c . "$results_file" 2>/dev/null); : "${alive_count:=0}"
     local good_list; good_list=$(create_temp_file)
     echo "[]" > "$good_list"
     local temp_results; temp_results=$(create_temp_file)
@@ -1038,7 +1087,7 @@ check_remove_unavailable() {
             fi
         done
 
-        local alive_countries; alive_countries=$(printf '%s' "$countries" | grep -c . 2>/dev/null || echo 0)
+        local alive_countries; alive_countries=$(printf '%s' "$countries" | grep -c . 2>/dev/null); : "${alive_countries:=0}"
         log_info "Check complete (by_country): $kept kept across $alive_countries countries, $fail dead, $skipped skipped"
         echo ""
         echo -e "${GREEN}Results:${NC} $kept kept across ${CYAN}$alive_countries${NC} countries (${YELLOW}$check_mode${NC} per country), ${RED}$fail dead${NC}, ${DGRAY}$skipped skipped${NC}"
@@ -1057,7 +1106,7 @@ check_remove_unavailable() {
         esac
         [ "$keep_count" -gt "$alive_count" ] && keep_count="$alive_count"
 
-        while IFS=' ' read -r cname delay_padded entry_b64; do
+        while read -r cname delay_padded entry_b64; do
             [ -z "$entry_b64" ] && continue
             [ "$kept" -ge "$keep_count" ] && break
             local entry_json; entry_json=$(printf '%s' "$entry_b64" | base64 -d 2>/dev/null)
@@ -1074,232 +1123,6 @@ check_remove_unavailable() {
 
     cp "$good_list" "$SBSM_DB_FILE"
 
-    return 0
-}
-
-_build_tag_map() {
-    local config_file="$1"
-    [ ! -f "$config_file" ] && return 1
-    jq -r '[.outbounds[] | select(.server and .server_port)] | .[] | (.server + ":" + (.server_port | tostring) + " " + .tag)' \
-        "$config_file" 2>/dev/null
-}
-
-_find_tag_by_host_port() {
-    local map_file="$1" target="$2"
-    [ ! -f "$map_file" ] && { printf ''; return; }
-    grep -E "^${target} " "$map_file" 2>/dev/null | head -1 | sed 's/^[^ ]* //'
-}
-
-_get_clash_api_addr() {
-    [ ! -f "$SBSM_CONFIG_FILE" ] && { printf ''; return 1; }
-    local addr
-    addr=$(jq -r '.experimental.clash_api.external_controller // empty' "$SBSM_CONFIG_FILE" 2>/dev/null)
-    [ -z "$addr" ] && { printf ''; return 1; }
-    printf 'http://%s' "$addr"
-}
-
-_ensure_singbox_running() {
-    if [ -x "/etc/init.d/sing-box" ] && /etc/init.d/sing-box status >/dev/null 2>&1; then
-        return 0
-    fi
-    if [ -f "$SBSM_CONFIG_FILE" ]; then
-        if ! sing-box check -c "$SBSM_CONFIG_FILE" >/dev/null 2>&1; then
-            log_error "Cannot start sing-box: config validation failed"
-            return 1
-        fi
-        if [ -x "/etc/init.d/sing-box" ]; then
-            /etc/init.d/sing-box start >/dev/null 2>&1
-        else
-            sing-box run -c "$SBSM_CONFIG_FILE" &
-        fi
-        sleep 3
-        return 0
-    fi
-    return 1
-}
-
-check_remove_unavailable() {
-    local db_file="$SBSM_DB_FILE"
-    local check_url; check_url=$(get_check_url)
-    local check_mode; check_mode=$(get_check_mode)
-
-    local total; total=$(jq 'length' "$db_file" 2>/dev/null || echo 0)
-    if [ "$total" -eq 0 ]; then
-        echo -e "${YELLOW}Database is empty.${NC}"
-        return 0
-    fi
-
-    log_info "Checking $total proxies via sing-box (mode=$check_mode, url=$check_url)..."
-    echo -e "${MAGENTA}Checking $total proxies${NC} (mode=${YELLOW}$check_mode${NC}, url=${CYAN}${check_url}${NC})..."
-
-    _ensure_singbox_running
-
-    local api_base="" use_api=0
-    api_base=$(_get_clash_api_addr)
-    if [ -n "$api_base" ]; then
-        if curl -s --max-time 3 "${api_base}/version" >/dev/null 2>&1; then
-            use_api=1
-            log_info "Using clash_api at $api_base"
-            echo -e "  ${CYAN}Method: clash_api${NC} ($api_base)"
-        fi
-    fi
-
-    if [ "$use_api" -eq 0 ] && [ ! -f "$SBSM_CONFIG_FILE" ]; then
-        log_error "No sing-box config found, cannot test proxies"
-        echo -e "  ${RED}Error: No sing-box config. Run build first.${NC}"
-        return 1
-    fi
-
-    if [ "$use_api" -eq 0 ]; then
-        log_info "Using sing-box tools fetch"
-        echo -e "  ${CYAN}Method: sing-box tools fetch${NC}"
-    fi
-
-    local tag_map; tag_map=$(create_temp_file)
-    _build_tag_map "$SBSM_CONFIG_FILE" > "$tag_map"
-
-    # Collect results: each line = "country delay entry_base64"
-    # country is included for by_country mode filtering
-    local cur_mode; cur_mode=$(get_mode)
-    local results_file; results_file=$(create_temp_file)
-    : > "$results_file"
-    local fail=0 untagged=0
-
-    local index=0
-    while [ "$index" -lt "$total" ]; do
-        local entry url remark
-        entry=$(jq -r ".[$index] | @base64" "$db_file" 2>/dev/null)
-        [ -z "$entry" ] && { index=$((index + 1)); continue; }
-        url=$(printf '%s' "$entry" | base64 -d 2>/dev/null | jq -r '.url' 2>/dev/null)
-        remark=$(printf '%s' "$entry" | base64 -d 2>/dev/null | jq -r '.remark' 2>/dev/null | cut -c1-40)
-
-        local host_port; host_port=$(_parse_host_port "$url")
-        local tag; tag=$(_find_tag_by_host_port "$tag_map" "$host_port")
-
-        printf '  Testing %-42s ' "${remark}..."
-
-        if [ -z "$tag" ]; then
-            printf "${DGRAY}SKIP${NC} ${DGRAY}(no outbound)${NC}\n"
-            untagged=$((untagged + 1))
-            index=$((index + 1))
-            continue
-        fi
-
-        local delay=""
-        if [ "$use_api" -eq 1 ]; then
-            local api_result
-            api_result=$(curl -s --max-time 10 \
-                "${api_base}/proxies/${tag}/delay?timeout=${PROXY_TEST_TIMEOUT}&url=${check_url}" 2>/dev/null)
-            if [ -n "$api_result" ] && printf '%s' "$api_result" | grep -q '"delay"'; then
-                delay=$(printf '%s' "$api_result" | jq -r '.delay' 2>/dev/null)
-                printf "${GREEN}OK${NC} ${DGRAY}(%sms)${NC}\n" "$delay"
-            else
-                printf "${RED}FAIL${NC}\n"
-            fi
-        else
-            rm -f /tmp/sing-box/cache.db 2>/dev/null
-            if sing-box -c "$SBSM_CONFIG_FILE" tools fetch \
-                --outbound "$tag" "$check_url" >/dev/null 2>/dev/null; then
-                delay="0"
-                printf "${GREEN}OK${NC}\n"
-            else
-                printf "${RED}FAIL${NC}\n"
-            fi
-        fi
-
-        if [ -n "$delay" ]; then
-            local delay_int; delay_int=$(printf '%s' "$delay" | sed 's/[^0-9]//g')
-            [ -z "$delay_int" ] && delay_int="99999"
-            local country="_"
-            if [ "$cur_mode" = "by_country" ]; then
-                country=$(get_country_from_remark "$remark")
-            fi
-            printf '%s %05d %s\n' "$country" "$delay_int" "$entry" >> "$results_file"
-        else
-            fail=$((fail + 1))
-        fi
-        index=$((index + 1))
-    done
-
-    # Apply check_mode filter
-    local alive_count; alive_count=$(grep -c . "$results_file" 2>/dev/null || echo 0)
-    local good_list; good_list=$(create_temp_file)
-    echo "[]" > "$good_list"
-    local temp_results; temp_results=$(create_temp_file)
-    local kept=0
-
-    if [ "$cur_mode" = "by_country" ] && [ "$check_mode" != "all" ]; then
-        # Per-country filtering: keep N best per country
-        local keep_count
-        case "$check_mode" in
-            fastest) keep_count=1 ;;
-            5)       keep_count=5 ;;
-            10)      keep_count=10 ;;
-            20)      keep_count=20 ;;
-            *)       keep_count="$alive_count" ;;
-        esac
-
-        # Get unique country codes from results
-        local countries; countries=$(awk '{print $1}' "$results_file" | sort -u)
-
-        # For each country: sort by delay, extract top N base64 entries to temp file
-        for c in $countries; do
-            grep "^${c} " "$results_file" | sort -k2 -n | awk '{print $3}' | head -n "$keep_count" \
-                > "${good_list}_country_${c}" 2>/dev/null
-        done
-
-        # Merge all country picks into good_list
-        kept=0
-        for c in $countries; do
-            local cfile="${good_list}_country_${c}"
-            if [ -f "$cfile" ] && [ -s "$cfile" ]; then
-                while IFS= read -r entry_b64; do
-                    [ -z "$entry_b64" ] && continue
-                    local entry_json; entry_json=$(printf '%s' "$entry_b64" | base64 -d 2>/dev/null)
-                    [ -z "$entry_json" ] && continue
-                    jq --argjson e "$entry_json" '. += [$e]' "$good_list" > "$temp_results" && \
-                        mv "$temp_results" "$good_list"
-                    kept=$((kept + 1))
-                done < "$cfile"
-                rm -f "$cfile"
-            fi
-        done
-
-        local alive_countries; alive_countries=$(printf '%s' "$countries" | grep -c . 2>/dev/null || echo 0)
-        log_info "Check complete (by_country): $kept kept across $alive_countries countries, $fail dead, $untagged skipped"
-        echo ""
-        echo -e "${GREEN}Results:${NC} $kept kept across ${CYAN}$alive_countries${NC} countries (${YELLOW}$check_mode${NC} per country), ${RED}$fail dead${NC}, ${DGRAY}$untagged skipped${NC}"
-    else
-        # Global filtering (russia_inside, subscription, or check_mode=all)
-        local sorted_file; sorted_file=$(create_temp_file)
-        sort -k2 -n "$results_file" > "$sorted_file"
-
-        local keep_count
-        case "$check_mode" in
-            fastest) keep_count=1 ;;
-            5)       keep_count=5 ;;
-            10)      keep_count=10 ;;
-            20)      keep_count=20 ;;
-            all|*)   keep_count="$alive_count" ;;
-        esac
-        [ "$keep_count" -gt "$alive_count" ] && keep_count="$alive_count"
-
-        while IFS=' ' read -r cname delay_padded entry_b64; do
-            [ -z "$entry_b64" ] && continue
-            [ "$kept" -ge "$keep_count" ] && break
-            local entry_json; entry_json=$(printf '%s' "$entry_b64" | base64 -d 2>/dev/null)
-            jq --argjson e "$entry_json" '. += [$e]' "$good_list" > "$temp_results" && \
-                mv "$temp_results" "$good_list"
-            kept=$((kept + 1))
-        done < "$sorted_file"
-
-        local removed=$((alive_count - kept))
-        log_info "Check complete: $kept kept (of $alive_count alive), $removed filtered out, $fail dead, $untagged skipped"
-        echo ""
-        echo -e "${GREEN}Results:${NC} $kept kept (of $alive_count alive), ${YELLOW}$removed filtered${NC} by mode '$check_mode', ${RED}$fail dead${NC}, ${DGRAY}$untagged skipped${NC}"
-    fi
-
-    cp "$good_list" "$SBSM_DB_FILE"
     return 0
 }
 
@@ -1383,10 +1206,10 @@ cmd_clear_db() {
 usage() {
     echo "Usage: sbsm_extended.sh [command]"; echo ""
     echo "  fetch          Download subscriptions and build config"
-    echo "  update [--clean]  Full cycle: fetch + build + restart + check"
+    echo "  update [--clean]  Full cycle: fetch + check + build + restart"
     echo "  update             (add --clean to clear DB first)"
     echo "  build          Generate config.json from database"
-    echo "  check          Build + restart + check proxy availability"
+    echo "  check          Check proxy availability + build + restart"
     echo "  clear_db       Remove all proxies from database"
     echo "  status         Show current status"
     echo "  validate       Validate all proxy URLs in database"
@@ -1395,6 +1218,8 @@ usage() {
     echo "  ru_srs [URLs]  Get/set custom RU SRS rule URLs"
     echo "  check_mode [M] Get/set checking mode: fastest, 5, 10, 20, all"
     echo "  check_url [U]  Get/set check URL for proxy testing"
+    echo "  batch_size [N] Get/set parallel batch size (1-30, default 10)"
+    echo "  check_timeout [N] Get/set check timeout in ms (1000-15000, default 5000)"
     echo "  subs list/add  Manage subscriptions"
     echo "  menu           Interactive menu (default)"
     echo "  help           Show this help"
@@ -1403,7 +1228,7 @@ usage() {
 
 show_menu() {
     while true; do
-        clear; echo -e "${CYAN}=== SBSM Extended v0.5.1 ===${NC}"; echo ""
+        clear; echo -e "${CYAN}=== SBSM Extended v0.7.0 ===${NC}"; echo ""
         local pc=$(jq 'length' "$SBSM_DB_FILE" 2>/dev/null || echo 0)
         echo -e "Proxies: ${GREEN}$pc${NC}  Mode: ${YELLOW}$(get_mode)${NC}  SB: ${YELLOW}$(get_sb_mode)${NC}"; echo ""
         echo "1. Update Subscriptions (fetch + build + restart)"
@@ -1430,6 +1255,7 @@ _settings_menu() {
         clear; echo -e "${CYAN}=== Settings ===${NC}"; echo ""
         echo "Group Mode: $(get_mode)"; echo "Sing-Box Mode: $(get_sb_mode)"
         echo "Check Mode: $(get_check_mode) | Check URL: $(get_check_url)"
+        echo "Batch: $(get_batch_size) parallel | Timeout: $(get_check_timeout)ms"
         subs_list; echo ""
         echo "1. Change Group Mode (by_country/russia_inside/subscription)"
         echo "2. Change Sing-Box Mode (tun/tproxy_fakeip)"
@@ -1450,9 +1276,12 @@ _settings_menu() {
 
 _check_settings_menu() {
     while true; do
-        clear; echo -e "${CYAN}=== Checking Mode Settings ===${NC}"; echo ""
-        echo "Current check mode: $(get_check_mode)"
-        echo "Current check URL:  $(get_check_url)"
+        clear
+        echo "=== Checking Mode Settings ==="
+        echo "Check mode:   $(get_check_mode)"
+        echo "Check URL:    $(get_check_url)"
+        echo "Batch size:   $(get_batch_size) (parallel connections)"
+        echo "Timeout:      $(get_check_timeout)ms"
         echo ""
         echo "1. Fastest (1 proxy with lowest ping)"
         echo "2. Top 5 fastest proxies"
@@ -1460,8 +1289,10 @@ _check_settings_menu() {
         echo "4. Top 20 fastest proxies"
         echo "5. All (keep all alive proxies)"
         echo "6. Change Check URL"
+        echo "7. Change Batch Size (1-30)"
+        echo "8. Change Timeout (1000-15000ms)"
         echo "0. Back"
-        printf "Choice [0-6]: "; read -r cm
+        printf "Choice [0-8]: "; read -r cm
         case "$cm" in
             1) set_check_mode "fastest"; echo "Set: fastest" ;;
             2) set_check_mode "5"; echo "Set: top 5" ;;
@@ -1469,8 +1300,11 @@ _check_settings_menu() {
             4) set_check_mode "20"; echo "Set: top 20" ;;
             5) set_check_mode "all"; echo "Set: all" ;;
             6) printf "New URL: "; read -r new_url; set_check_url "$new_url"; echo "Set: $new_url" ;;
+            7) printf "Batch size (1-30, default 10): "; read -r new_batch; set_batch_size "$new_batch"; echo "Set: $(get_batch_size)" ;;
+            8) printf "Timeout ms (1000/2000/3000/5000/10000/15000): "; read -r new_timeout; set_check_timeout "$new_timeout"; echo "Set: $(get_check_timeout)ms" ;;
             0) break ;;
-        esac; echo "Press Enter..."; read -r _
+        esac
+        echo "Press Enter..."; read -r _
     done
 }
 
@@ -1526,6 +1360,8 @@ main() {
         ru_srs)  if [ -z "${2:-}" ]; then get_ru_srs; else set_ru_srs "$2"; fi ;;
         check_mode) init_config; [ -n "$2" ] && set_check_mode "$2"; get_check_mode ;;
         check_url)  init_config; [ -n "$2" ] && set_check_url "$2"; get_check_url ;;
+        batch_size) init_config; [ -n "$2" ] && set_batch_size "$2"; get_batch_size ;;
+        check_timeout) init_config; [ -n "$2" ] && set_check_timeout "$2"; get_check_timeout ;;
         subs)
             case "${2:-list}" in
                 list) subs_list ;; add) subs_add "${3:-}" ;; remove) subs_remove "${3:-}" ;;
