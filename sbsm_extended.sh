@@ -844,7 +844,9 @@ check_remove_unavailable() {
     local tag_map; tag_map=$(create_temp_file)
     _build_tag_map "$SBSM_CONFIG_FILE" > "$tag_map"
 
-    # Collect results: each line = "delay entry_base64"
+    # Collect results: each line = "country delay entry_base64"
+    # country is included for by_country mode filtering
+    local cur_mode; cur_mode=$(get_mode)
     local results_file; results_file=$(create_temp_file)
     : > "$results_file"
     local fail=0 untagged=0
@@ -894,49 +896,96 @@ check_remove_unavailable() {
         if [ -n "$delay" ]; then
             local delay_int; delay_int=$(printf '%s' "$delay" | sed 's/[^0-9]//g')
             [ -z "$delay_int" ] && delay_int="99999"
-            printf '%05d %s\n' "$delay_int" "$entry" >> "$results_file"
+            local country="_"
+            if [ "$cur_mode" = "by_country" ]; then
+                country=$(get_country_from_remark "$remark")
+            fi
+            printf '%s %05d %s\n' "$country" "$delay_int" "$entry" >> "$results_file"
         else
             fail=$((fail + 1))
         fi
         index=$((index + 1))
     done
 
-    # Sort by delay and apply check_mode filter
-    local sorted_file; sorted_file=$(create_temp_file)
-    sort -n "$results_file" > "$sorted_file"
-
-    local alive_count; alive_count=$(grep -c . "$sorted_file" 2>/dev/null || echo 0)
-
-    local keep_count
-    case "$check_mode" in
-        fastest) keep_count=1 ;;
-        5)       keep_count=5 ;;
-        10)      keep_count=10 ;;
-        20)      keep_count=20 ;;
-        all|*)   keep_count="$alive_count" ;;
-    esac
-    [ "$keep_count" -gt "$alive_count" ] && keep_count="$alive_count"
-
+    # Apply check_mode filter
+    local alive_count; alive_count=$(grep -c . "$results_file" 2>/dev/null || echo 0)
     local good_list; good_list=$(create_temp_file)
     echo "[]" > "$good_list"
     local temp_results; temp_results=$(create_temp_file)
     local kept=0
 
-    while IFS=' ' read -r delay_padded entry_b64; do
-        [ -z "$entry_b64" ] && continue
-        [ "$kept" -ge "$keep_count" ] && break
-        local entry_json; entry_json=$(printf '%s' "$entry_b64" | base64 -d 2>/dev/null)
-        jq --argjson e "$entry_json" '. += [$e]' "$good_list" > "$temp_results" && \
-            mv "$temp_results" "$good_list"
-        kept=$((kept + 1))
-    done < "$sorted_file"
+    if [ "$cur_mode" = "by_country" ] && [ "$check_mode" != "all" ]; then
+        # Per-country filtering: keep N best per country
+        local keep_count
+        case "$check_mode" in
+            fastest) keep_count=1 ;;
+            5)       keep_count=5 ;;
+            10)      keep_count=10 ;;
+            20)      keep_count=20 ;;
+            *)       keep_count="$alive_count" ;;
+        esac
+
+        # Get unique country codes from results
+        local countries; countries=$(awk '{print $1}' "$results_file" | sort -u)
+
+        # For each country: sort by delay, extract top N base64 entries to temp file
+        for c in $countries; do
+            grep "^${c} " "$results_file" | sort -k2 -n | awk '{print $3}' | head -n "$keep_count" \
+                > "${good_list}_country_${c}" 2>/dev/null
+        done
+
+        # Merge all country picks into good_list
+        kept=0
+        for c in $countries; do
+            local cfile="${good_list}_country_${c}"
+            if [ -f "$cfile" ] && [ -s "$cfile" ]; then
+                while IFS= read -r entry_b64; do
+                    [ -z "$entry_b64" ] && continue
+                    local entry_json; entry_json=$(printf '%s' "$entry_b64" | base64 -d 2>/dev/null)
+                    [ -z "$entry_json" ] && continue
+                    jq --argjson e "$entry_json" '. += [$e]' "$good_list" > "$temp_results" && \
+                        mv "$temp_results" "$good_list"
+                    kept=$((kept + 1))
+                done < "$cfile"
+                rm -f "$cfile"
+            fi
+        done
+
+        local alive_countries; alive_countries=$(printf '%s' "$countries" | grep -c . 2>/dev/null || echo 0)
+        log_info "Check complete (by_country): $kept kept across $alive_countries countries, $fail dead, $untagged skipped"
+        echo ""
+        echo -e "${GREEN}Results:${NC} $kept kept across ${CYAN}$alive_countries${NC} countries (${YELLOW}$check_mode${NC} per country), ${RED}$fail dead${NC}, ${DGRAY}$untagged skipped${NC}"
+    else
+        # Global filtering (russia_inside, subscription, or check_mode=all)
+        local sorted_file; sorted_file=$(create_temp_file)
+        sort -k2 -n "$results_file" > "$sorted_file"
+
+        local keep_count
+        case "$check_mode" in
+            fastest) keep_count=1 ;;
+            5)       keep_count=5 ;;
+            10)      keep_count=10 ;;
+            20)      keep_count=20 ;;
+            all|*)   keep_count="$alive_count" ;;
+        esac
+        [ "$keep_count" -gt "$alive_count" ] && keep_count="$alive_count"
+
+        while IFS=' ' read -r cname delay_padded entry_b64; do
+            [ -z "$entry_b64" ] && continue
+            [ "$kept" -ge "$keep_count" ] && break
+            local entry_json; entry_json=$(printf '%s' "$entry_b64" | base64 -d 2>/dev/null)
+            jq --argjson e "$entry_json" '. += [$e]' "$good_list" > "$temp_results" && \
+                mv "$temp_results" "$good_list"
+            kept=$((kept + 1))
+        done < "$sorted_file"
+
+        local removed=$((alive_count - kept))
+        log_info "Check complete: $kept kept (of $alive_count alive), $removed filtered out, $fail dead, $untagged skipped"
+        echo ""
+        echo -e "${GREEN}Results:${NC} $kept kept (of $alive_count alive), ${YELLOW}$removed filtered${NC} by mode '$check_mode', ${RED}$fail dead${NC}, ${DGRAY}$untagged skipped${NC}"
+    fi
 
     cp "$good_list" "$SBSM_DB_FILE"
-
-    local removed=$((alive_count - kept))
-    log_info "Check complete: $kept kept (of $alive_count alive), $removed filtered out, $fail dead, $untagged skipped"
-    echo ""
-    echo -e "${GREEN}Results:${NC} $kept kept (of $alive_count alive), ${YELLOW}$removed filtered${NC} by mode '$check_mode', ${RED}$fail dead${NC}, ${DGRAY}$untagged skipped${NC}"
     return 0
 }
 
