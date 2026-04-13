@@ -1424,6 +1424,18 @@ cmd_validate() {
     [ "$invalid" -eq 0 ] && return 0 || return 1
 }
 
+# cmd_clear_db() - Clear proxy database
+cmd_clear_db() {
+    local count; count=$(jq 'length' "$SBSM_DB_FILE" 2>/dev/null || echo 0)
+    if [ "$count" -eq 0 ]; then
+        echo -e "${YELLOW}Database is already empty.${NC}"
+        return 0
+    fi
+    echo "[]" > "$SBSM_DB_FILE"
+    log_info "Database cleared ($count proxies removed)"
+    echo -e "${GREEN}Database cleared:${NC} removed $count proxies"
+}
+
 # =============================================================================
 # H. Interactive Menus
 # =============================================================================
@@ -1445,13 +1457,18 @@ show_menu() {
         echo -e "${CYAN}1) ${GREEN}Update Subscriptions${NC} (download & sync)"
         echo -e "${CYAN}2) ${GREEN}Check Proxies${NC} (remove dead links)"
         echo -e "${CYAN}3) ${GREEN}Settings${NC} (manage subs, change mode)"
+        echo -e "${CYAN}4) ${GREEN}Clear Database${NC} (remove all proxies)"
         echo -e "${CYAN}0) ${GREEN}Exit${NC}"
         echo -e "${DGRAY}────────────────────────────────────────────────────${NC}"
-        printf "${YELLOW}Choice [0-3]:${NC} "; read -r choice
+        printf "${YELLOW}Choice [0-4]:${NC} "; read -r choice
         case "$choice" in
-            1) echo ""; if fetch_subscriptions; then manage_uci && restart_target && sleep 3 && check_remove_unavailable && manage_uci && remove_empty_sections && restart_target; fi; echo "Press Enter..."; read -r _ ;;
+            1) echo ""; printf "${YELLOW}Clean DB before update? [y/N]:${NC} "; read -r clean_db
+               if [ "$clean_db" = "y" ] || [ "$clean_db" = "Y" ]; then cmd_clear_db; fi
+               if fetch_subscriptions; then manage_uci && restart_target && sleep 3 && check_remove_unavailable && manage_uci && remove_empty_sections && restart_target; fi; echo "Press Enter..."; read -r _ ;;
             2) echo ""; manage_uci && restart_target && sleep 3 && check_remove_unavailable && manage_uci && remove_empty_sections && restart_target; echo "Press Enter..."; read -r _ ;;
             3) show_settings_menu ;;
+            4) echo ""; printf "${RED}Remove all proxies from database? [y/N]:${NC} "; read -r confirm
+               if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then cmd_clear_db; else echo "Cancelled."; fi; echo "Press Enter..."; read -r _ ;;
             0) break ;;
             *) echo "Invalid choice."; sleep 1 ;;
         esac
@@ -1522,7 +1539,10 @@ _check_settings_menu() {
 # =============================================================================
 
 usage() {
-    echo "Usage: $0 {fetch|check|sync|update|validate|mode|check_mode|check_url|status|log|menu}"
+    echo "Usage: $0 {fetch|check|sync|update|validate|mode|check_mode|check_url|clear_db|status|log|menu}"
+    echo ""
+    echo "  update [--clean]  Fetch + check + sync (--clean to clear DB first)"
+    echo "  clear_db          Remove all proxies from database"
     exit 0
 }
 
@@ -1533,10 +1553,13 @@ main() {
         fetch) dependency_check && init_config && fetch_subscriptions ;;
         check) dependency_check && init_config && manage_uci && restart_target && sleep 3 && check_remove_unavailable && manage_uci && remove_empty_sections && restart_target ;;
         sync)  dependency_check && init_config && manage_uci && restart_target ;;
-        update) dependency_check && init_config && fetch_subscriptions && manage_uci && restart_target && sleep 3 && check_remove_unavailable && manage_uci && remove_empty_sections && restart_target ;;
+        update) dependency_check && init_config
+               [ "${2:-}" = "--clean" ] && cmd_clear_db
+               fetch_subscriptions && manage_uci && restart_target && sleep 3 && check_remove_unavailable && manage_uci && remove_empty_sections && restart_target ;;
         mode)   init_config; [ -n "$2" ] && set_mode "$2"; get_mode ;;
         check_mode) init_config; [ -n "$2" ] && set_check_mode "$2"; get_check_mode ;;
         check_url)  init_config; [ -n "$2" ] && set_check_url "$2"; get_check_url ;;
+        clear_db) init_config; cmd_clear_db ;;
         validate) dependency_check && init_config && cmd_validate ;;
         status)
             echo "Sing-Box: $(command -v sing-box >/dev/null && sing-box version | head -n1 || echo 'NOT FOUND')"

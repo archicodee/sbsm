@@ -1065,6 +1065,18 @@ manage_json_config() {
     _setup_tproxy_rules
 }
 
+# cmd_clear_db() - Clear proxy database
+cmd_clear_db() {
+    local count; count=$(jq 'length' "$SBSM_DB_FILE" 2>/dev/null || echo 0)
+    if [ "$count" -eq 0 ]; then
+        echo -e "${YELLOW}Database is already empty.${NC}"
+        return 0
+    fi
+    echo "[]" > "$SBSM_DB_FILE"
+    log_info "Database cleared ($count proxies removed)"
+    echo -e "${GREEN}Database cleared:${NC} removed $count proxies"
+}
+
 # =============================================================================
 # I. Main Interface
 # =============================================================================
@@ -1072,9 +1084,11 @@ manage_json_config() {
 usage() {
     echo "Usage: sbsm_extended.sh [command]"; echo ""
     echo "  fetch          Download subscriptions and build config"
-    echo "  update         Full cycle: fetch + build + restart"
+    echo "  update [--clean]  Full cycle: fetch + build + restart + check"
+    echo "  update             (add --clean to clear DB first)"
     echo "  build          Generate config.json from database"
     echo "  check          Build + restart + check proxy availability"
+    echo "  clear_db       Remove all proxies from database"
     echo "  status         Show current status"
     echo "  validate       Validate all proxy URLs in database"
     echo "  mode [MODE]    Get/set mode: by_country, russia_inside, subscription"
@@ -1095,12 +1109,18 @@ show_menu() {
         echo -e "Proxies: ${GREEN}$pc${NC}  Mode: ${YELLOW}$(get_mode)${NC}  SB: ${YELLOW}$(get_sb_mode)${NC}"; echo ""
         echo "1. Update Subscriptions (fetch + build + restart)"
         echo "2. Build Config (from database)"
-        echo "3. Settings (mode, sb_mode, subs)"; echo "0. Exit"; echo ""
+        echo "3. Settings (mode, sb_mode, subs)"
+        echo "4. Clear Database (remove all proxies)"
+        echo "0. Exit"; echo ""
         printf "Choice: "; read -r c
         case "$c" in
-            1) fetch_subscriptions && manage_json_config && restart_target && sleep 3 && check_remove_unavailable && manage_json_config && restart_target ;;
+            1) printf "${YELLOW}Clean DB before update? [y/N]:${NC} "; read -r clean_db
+               [ "$clean_db" = "y" ] || [ "$clean_db" = "Y" ] && cmd_clear_db
+               fetch_subscriptions && manage_json_config && restart_target && sleep 3 && check_remove_unavailable && manage_json_config && restart_target ;;
             2) manage_json_config && restart_target ;;
             3) _settings_menu ;;
+            4) printf "${RED}Remove all proxies from database? [y/N]:${NC} "; read -r confirm
+               [ "$confirm" = "y" ] || [ "$confirm" = "Y" ] && cmd_clear_db || echo "Cancelled." ;;
             0) break ;;
         esac; echo "Press Enter..."; read -r _
     done
@@ -1189,7 +1209,9 @@ main() {
         fetch)   fetch_subscriptions ;;
         build)   manage_json_config ;;
         check)   manage_json_config && restart_target && sleep 3 && check_remove_unavailable && manage_json_config && restart_target ;;
-        update)  fetch_subscriptions && manage_json_config && restart_target && sleep 3 && check_remove_unavailable && manage_json_config && restart_target ;;
+        update)  [ "${2:-}" = "--clean" ] && cmd_clear_db
+                 fetch_subscriptions && manage_json_config && restart_target && sleep 3 && check_remove_unavailable && manage_json_config && restart_target ;;
+        clear_db) cmd_clear_db ;;
         status)  echo "Proxies: $(jq 'length' "$SBSM_DB_FILE" 2>/dev/null || echo 0)  Mode: $(get_mode)  SB: $(get_sb_mode)" ;;
         validate)
             local total=$(jq 'length' "$SBSM_DB_FILE" 2>/dev/null || echo 0) valid=0 invalid=0 i=0
