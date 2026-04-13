@@ -759,8 +759,10 @@ fetch_subscriptions() {
     local line
     local count
     
-    # Collect all entries in memory to reduce jq calls
-    local all_entries="[]"
+    # Collect entries in a temp file to avoid memory/ARG_MAX overflow on BusyBox
+    local all_entries_file; all_entries_file=$(create_temp_file)
+    echo "[]" > "$all_entries_file"
+    local all_entries_tmp; all_entries_tmp=$(create_temp_file)
     
     while IFS= read -r sub_url || [ -n "$sub_url" ]; do
         [ -z "$sub_url" ] && continue
@@ -845,7 +847,9 @@ fetch_subscriptions() {
 
             local new_entry
             new_entry=$(jq -n --arg u "$url_clean" --arg r "$remark" '{"url":$u,"remark":$r}')
-            all_entries=$(printf '%s' "$all_entries" | jq --argjson e "$new_entry" '. += [$e]')
+            # Append to file instead of memory to avoid ARG_MAX overflow
+            jq --argjson e "$new_entry" '. += [$e]' "$all_entries_file" > "$all_entries_tmp" && \
+                mv "$all_entries_tmp" "$all_entries_file"
             count=$((count + 1))
             valid_count=$((valid_count + 1))
         done < "$filtered_file"
@@ -860,7 +864,19 @@ fetch_subscriptions() {
     if [ "$total_added" -gt 0 ]; then
         local existing_db
         existing_db=$(cat "$SBSM_DB_FILE" 2>/dev/null || echo '[]')
-        printf '%s' "$existing_db" | jq --argjson new "$all_entries" '. + $new | unique_by(.url)' > "$SBSM_DB_FILE" 2>/dev/null
+        local existing_file; existing_file=$(create_temp_file)
+        printf '%s' "$existing_db" > "$existing_file"
+        # Use --slurpfile to pass new entries via file (avoids ARG_MAX overflow)
+        if ! jq --slurpfile new "$all_entries_file" '. + $new[0] | unique_by(.url)' "$existing_file" > "$SBSM_DB_FILE" 2>/dev/null; then
+            # Fallback: merge via stdin pipe
+            printf '%s' "$existing_db" | jq --slurpfile new "$all_entries_file" '. + $new[0] | unique_by(.url)' > "$SBSM_DB_FILE" 2>/dev/null
+        fi
+        # Last resort: if DB is still empty, copy new entries directly
+        if [ ! -s "$SBSM_DB_FILE" ]; then
+            cp "$all_entries_file" "$SBSM_DB_FILE"
+            log_error "DB merge failed, wrote new entries only (dedup skipped)"
+        fi
+        rm -f "$existing_file"
     else
         log_warn "No new proxies fetched, keeping existing database"
     fi

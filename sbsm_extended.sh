@@ -524,7 +524,11 @@ fetch_subscriptions() {
             fi
         fi
 
-        local count=0 valid_count=0 invalid_count=0 all_entries="[]"
+        local count=0 valid_count=0 invalid_count=0
+        # Collect entries in temp file to avoid memory/ARG_MAX overflow on BusyBox
+        local all_entries_file; all_entries_file=$(create_temp_file)
+        echo "[]" > "$all_entries_file"
+        local all_entries_tmp; all_entries_tmp=$(create_temp_file)
         while IFS= read -r line || [ -n "$line" ]; do
             line=$(printf '%s' "$line" | tr -d '\r'); [ -z "$line" ] && continue
             case "$line" in
@@ -536,18 +540,29 @@ fetch_subscriptions() {
                 local remark="${line##*#}" url_clean
                 url_clean=$(printf '%s' "$line" | sed "s/'/'\\\\''/g")
                 local ne=$(jq -n --arg u "$url_clean" --arg r "$remark" '{"url":$u,"remark":$r}')
-                all_entries=$(printf '%s' "$all_entries" | jq --argjson e "$ne" '. += [$e]')
+                # Append to file instead of memory to avoid ARG_MAX overflow
+                jq --argjson e "$ne" '. += [$e]' "$all_entries_file" > "$all_entries_tmp" && \
+                    mv "$all_entries_tmp" "$all_entries_file"
                 count=$((count + 1)); valid_count=$((valid_count + 1))
             else
                 invalid_count=$((invalid_count + 1))
             fi
         done < "$raw_file"
 
-        # Merge with existing DB
+        # Merge with existing DB (use --slurpfile to avoid ARG_MAX overflow on BusyBox)
         local existing="[]"; [ -f "$SBSM_DB_FILE" ] && existing=$(cat "$SBSM_DB_FILE" 2>/dev/null)
         [ -z "$existing" ] || [ "$existing" = "null" ] && existing="[]"
-        local merged=$(printf '%s' "$existing" | jq --argjson new "$all_entries" '. + $new | unique_by(.url)')
-        printf '%s' "$merged" > "$SBSM_DB_FILE"
+        local existing_file; existing_file=$(create_temp_file)
+        printf '%s' "$existing" > "$existing_file"
+        if ! jq --slurpfile new "$all_entries_file" '. + $new[0] | unique_by(.url)' "$existing_file" > "$SBSM_DB_FILE" 2>/dev/null; then
+            printf '%s' "$existing" | jq --slurpfile new "$all_entries_file" '. + $new[0] | unique_by(.url)' > "$SBSM_DB_FILE" 2>/dev/null
+        fi
+        # Last resort: if DB is still empty, write new entries directly (dedup skipped)
+        if [ ! -s "$SBSM_DB_FILE" ]; then
+            cp "$all_entries_file" "$SBSM_DB_FILE"
+            log_error "DB merge failed, wrote new entries only (dedup skipped)"
+        fi
+        rm -f "$all_entries_file" "$existing_file"
         total_added=$((total_added + valid_count))
         echo -e "  Added ${GREEN}$valid_count${NC} proxies (${YELLOW}$invalid_count${NC} invalid skipped)."
     done < "$sub_file"
